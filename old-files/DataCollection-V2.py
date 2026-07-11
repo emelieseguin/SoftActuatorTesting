@@ -140,7 +140,7 @@ class FFmpegRecorder:
         self.proc.wait()
 
         return self.out_path
-    
+
 
 # -----------------------
 # Main App
@@ -200,7 +200,7 @@ class App:
         self.lbl_cal_file.grid(row=0, column=1, sticky="w")
 
 
-        # Cycle Controls 
+        # Cycle Controls
         row += 1
         cycle_frame = ttk.LabelFrame(frm, text="Cycle Controls", padding=6)
         cycle_frame.grid(row=row, column=0, columnspan=5, sticky="ew", pady=6)
@@ -288,7 +288,7 @@ class App:
         else:
             ttk.Label(frm, text="Install matplotlib to see live plot").grid(row=row, column=0, columnspan=5)
 
-        
+
     def send_set_params(self):
         try:
             cycles = int(self.spin_cycles.get())
@@ -395,7 +395,7 @@ class App:
 
     def send_stop(self):
         self.send_serial("CMD:STOP")
-        
+
     def list_serial_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
         return ports
@@ -465,7 +465,7 @@ class App:
         self._after_process_serial = self.root.after(100, self.process_serial_queue)
 
     def handle_serial_line(self, line):
-  
+
         # -----------------------------
         # 1. Extract voltage correctly
         # -----------------------------
