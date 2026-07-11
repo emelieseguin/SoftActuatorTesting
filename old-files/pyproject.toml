@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "softactuatortesting-legacy"
+version = "0.1.0"
+description = "Legacy SoftActuatorTesting scripts and notebook"
+readme = "README.md"
+requires-python = ">=3.9,<3.14"
+dependencies = [
+  "numpy>=1.26",
+  "opencv-python>=4.10",
+  "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+plotting = [
+  "matplotlib>=3.8",
+]
+notebook = [
+  "ipykernel>=6",
+  "notebook>=7",
+]
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.wheel.force-include]
+"DataCollection-V2.py" = "softactuatortesting_legacy/DataCollection-V2.py"
+"PressureCalibration.py" = "softactuatortesting_legacy/PressureCalibration.py"
+"VideoConfig.py" = "softactuatortesting_legacy/VideoConfig.py"
+"PneumaticActuatorAnalysis-V1.ipynb" = "softactuatortesting_legacy/PneumaticActuatorAnalysis-V1.ipynb"
