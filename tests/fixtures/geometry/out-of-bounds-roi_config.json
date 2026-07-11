@@ -1,0 +1,16 @@
+{
+  "angle_base_point": {
+    "x": 20,
+    "y": 96
+  },
+  "angle_tip_point": {
+    "x": 140,
+    "y": 36
+  },
+  "actuator_roi": {
+    "x": 160,
+    "y": 100,
+    "w": 80,
+    "h": 60
+  }
+}

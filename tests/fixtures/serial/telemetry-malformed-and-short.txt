@@ -1,0 +1,4 @@
+only-one-field
+0.010,1.234
+0.020,ignored,not-a-number
+__ERROR__ Serial read error: simulated disconnect

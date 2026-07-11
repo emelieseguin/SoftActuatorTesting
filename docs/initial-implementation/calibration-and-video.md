@@ -140,6 +140,35 @@ Legend:
 4. **P2 — join or manage the reader thread explicitly.** Avoid relying on daemon-thread teardown.
 5. **P2 — replace silent exception swallowing in plotting with logged or visible errors.**
 
+## 2026-07-11 implementation follow-up
+
+The replacement calibration workflow uses a Qt-free `CalibrationSampleSource`
+that returns decoded `SerialTelemetry.volts` as a structured measurement with a
+monotonic sequence.  A capture records the sequence baseline before sending a
+request and accepts only a later measurement; it does not regex-match
+`raw_line` or depend on a 300 ms delay.  The authoring service validates a
+configurable finite pressure range, tracks source/timestamp provenance, keeps
+draft versus valid fit state, and exposes residuals, conditioning, R²/RMSE,
+domain/extrapolation warnings, undo, and editable samples to the UI.
+
+Versioned saves use `ArtifactFileStore`; payloads retain the compatible
+`model`/`samples` pairs plus fit quality, residuals, provenance, notes, and
+timestamps in their artifact envelope.  Legacy JSON is imported/exported
+through the existing strict adapter.  See
+[`../architecture/calibration-workflow-test-plan.md`](../architecture/calibration-workflow-test-plan.md)
+for hardware-free test coverage.
+
+### Capture boundedness correction (2026-07-11)
+
+The serial-backed calibration source now consumes only parsed
+`SerialController` telemetry frames, which are produced by the adapter-owned
+reader thread. It establishes a sequence baseline after draining queued frames,
+then polls until a configurable deadline or cancellation. `CAL_OFF` is sent in
+every path. The Qt page runs this bounded hardware wait in a `QThread`, prevents
+duplicate requests, exposes Cancel and actionable timeout/cancel/fault text,
+and joins the cancelled worker during teardown; fake capture remains immediate
+and deterministic.
+
 ## 2) `old-files/VideoConfig.py`
 
 ### Goal

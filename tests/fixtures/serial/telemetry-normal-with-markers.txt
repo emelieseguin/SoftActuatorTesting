@@ -1,0 +1,5 @@
+--- new run ---
+0.000,ignored,0.100
+0.100,ignored,1.100
+0.200,ignored,2.100
+--- end run ---

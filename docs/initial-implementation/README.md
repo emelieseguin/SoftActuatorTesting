@@ -5,6 +5,16 @@
 one notebook under [`old-files/`](../../old-files/). It does **not** yet contain
 the proposed `src/` rewrite.
 
+> A unified UI implementation plan has since been approved. Its architecture
+> decisions (UI framework/Qt boundaries, artifact versioning, concurrency,
+> the 4K60 capture benchmark, the two-shell evaluation, dependency licenses,
+> and the test plan) are recorded under
+> [`../architecture/`](../architecture/README.md). In particular, that plan
+> puts NI-DAQmx and a network/backend API out of scope for the current
+> rewrite effort — the "Prioritized rewrite roadmap" below predates that
+> decision and is kept here only as historical legacy-inventory context, not
+> as the current phase plan.
+
 ## Executive summary
 
 The legacy software supports a soft pneumatic-actuator experiment in four
@@ -387,7 +397,11 @@ verified limitations of the current code:
 
 ## Prioritized rewrite roadmap
 
-All items below are recommendations, not behavior already delivered.
+All items below are recommendations, not behavior already delivered. This
+roadmap predates the approved unified UI implementation plan; see
+[`../architecture/README.md`](../architecture/README.md) for the current
+phase plan and decisions, most notably that NI-DAQmx (Phase 2 below) is
+explicitly out of scope for that plan's effort.
 
 ### Phase 0 — establish safety and interfaces
 
@@ -488,6 +502,7 @@ isolated, and gated by the lab safety process.
 - NI Python binding: <https://github.com/ni/nidaqmx-python>
 - NI Python API documentation: <https://nidaqmx-python.readthedocs.io/>
 - NI driver downloads: <https://www.ni.com/downloads/>
+- Current approved rewrite architecture: [`../architecture/README.md`](../architecture/README.md)
 
 ## Verification summary
 

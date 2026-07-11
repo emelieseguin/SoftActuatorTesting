@@ -1,0 +1,1 @@
+"""Alternative application navigation shells."""

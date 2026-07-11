@@ -1,0 +1,37 @@
+[project]
+name = "soft-actuator-testing"
+version = "0.1.0"
+description = "Desktop application for soft actuator testing workflows."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy>=2.2.6",
+    "opencv-python>=5.0.0.93",
+    "pyqtgraph>=0.14.0",
+    "pyserial>=3.5",
+    "pyside6>=6.11.1",
+]
+
+[project.scripts]
+soft-actuator-testing = "soft_actuator_testing.bootstrap:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/soft_actuator_testing"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not hardware and not external_ffmpeg'"
+testpaths = ["tests"]
+markers = [
+  "hardware: requires an approved physical test rig and is excluded by default",
+  "external_ffmpeg: requires external ffmpeg/ffprobe but no camera hardware",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-qt>=4.5.0",
+]
