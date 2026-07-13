@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+from fractions import Fraction
 from math import isfinite
+from numbers import Real
 
 from .errors import ErrorCode, GeometryError
 
@@ -35,7 +38,7 @@ class PixelPoint:
     y: float
 
     def __post_init__(self) -> None:
-        if not isfinite(self.x) or not isfinite(self.y):
+        if not _is_finite_number(self.x) or not _is_finite_number(self.y):
             raise GeometryError(ErrorCode.NON_FINITE_VALUE, "point coordinates must be finite", "point")
 
     def validate_in(self, frame_size: FrameSize, field_path: str = "point") -> None:
@@ -58,7 +61,7 @@ class NormalizedRoi:
     bottom: float
 
     def __post_init__(self) -> None:
-        if not all(isfinite(value) for value in (self.left, self.top, self.right, self.bottom)):
+        if not all(_is_finite_number(value) for value in (self.left, self.top, self.right, self.bottom)):
             raise GeometryError(ErrorCode.NON_FINITE_VALUE, "ROI bounds must be finite", "roi")
         if self.left >= self.right or self.top >= self.bottom:
             raise GeometryError(
@@ -118,3 +121,115 @@ class VideoGeometry:
         if self.initial_tip_point is not None:
             self.initial_tip_point.validate_in(self.frame_size, "initial_tip_point")
         self.actuator_roi.validate_in(self.frame_size)
+
+
+class PreviewTransformPolicy(str, Enum):
+    """How a full-resolution frame was made into a preview frame."""
+
+    STRETCH = "stretch"
+    LETTERBOX = "letterbox"
+    CROP = "crop"
+
+
+@dataclass(frozen=True)
+class PreviewGeometryTransform:
+    """Exact, reproducible full-frame to preview-pixel mapping.
+
+    The production capture proxy currently uses ``stretch`` because FFmpeg's
+    ``scale=width:height`` is configured with both dimensions.  Letterbox and
+    crop are explicit alternatives for callers that know their preview
+    producer's policy.  A crop is rejected only when the geometry required for
+    detection is outside the visible preview area.
+    """
+
+    source_frame_size: FrameSize
+    preview_frame_size: FrameSize
+    policy: PreviewTransformPolicy = PreviewTransformPolicy.STRETCH
+    _scale_x: Fraction = Fraction(1)
+    _scale_y: Fraction = Fraction(1)
+    _offset_x: Fraction = Fraction(0)
+    _offset_y: Fraction = Fraction(0)
+
+    @classmethod
+    def create(
+        cls,
+        source_frame_size: FrameSize,
+        preview_frame_size: FrameSize,
+        *,
+        policy: PreviewTransformPolicy = PreviewTransformPolicy.STRETCH,
+    ) -> PreviewGeometryTransform:
+        if not isinstance(policy, PreviewTransformPolicy):
+            raise GeometryError(ErrorCode.GEOMETRY_INVALID, "preview transform policy is invalid", "preview.policy")
+        source_width, source_height = source_frame_size.width, source_frame_size.height
+        preview_width, preview_height = preview_frame_size.width, preview_frame_size.height
+        if policy is PreviewTransformPolicy.STRETCH:
+            return cls(
+                source_frame_size,
+                preview_frame_size,
+                policy,
+                Fraction(preview_width, source_width),
+                Fraction(preview_height, source_height),
+            )
+        uniform_scale = (
+            min(Fraction(preview_width, source_width), Fraction(preview_height, source_height))
+            if policy is PreviewTransformPolicy.LETTERBOX
+            else max(Fraction(preview_width, source_width), Fraction(preview_height, source_height))
+        )
+        return cls(
+            source_frame_size,
+            preview_frame_size,
+            policy,
+            uniform_scale,
+            uniform_scale,
+            (Fraction(preview_width) - source_width * uniform_scale) / 2,
+            (Fraction(preview_height) - source_height * uniform_scale) / 2,
+        )
+
+    def map_point(self, point: PixelPoint, field_path: str = "point") -> PixelPoint:
+        point.validate_in(self.source_frame_size, field_path)
+        mapped = PixelPoint(
+            float(Fraction(point.x) * self._scale_x + self._offset_x),
+            float(Fraction(point.y) * self._scale_y + self._offset_y),
+        )
+        mapped.validate_in(self.preview_frame_size, field_path)
+        return mapped
+
+    def map_roi(self, roi: NormalizedRoi, field_path: str = "roi") -> NormalizedRoi:
+        roi.validate_in(self.source_frame_size)
+        mapped = NormalizedRoi(
+            float(Fraction(roi.left) * self._scale_x + self._offset_x),
+            float(Fraction(roi.top) * self._scale_y + self._offset_y),
+            float(Fraction(roi.right) * self._scale_x + self._offset_x),
+            float(Fraction(roi.bottom) * self._scale_y + self._offset_y),
+        )
+        try:
+            return mapped.validate_in(self.preview_frame_size)
+        except GeometryError as error:
+            if self.policy is PreviewTransformPolicy.CROP:
+                raise GeometryError(
+                    ErrorCode.GEOMETRY_INVALID,
+                    "crop preview excludes required geometry",
+                    field_path,
+                    "Use a preview crop containing the base point and actuator ROI, or use stretch/letterbox.",
+                ) from error
+            raise
+
+    def map_geometry(self, geometry: VideoGeometry) -> VideoGeometry:
+        if geometry.frame_size != self.source_frame_size:
+            raise GeometryError(
+                ErrorCode.GEOMETRY_INVALID,
+                "geometry frame size does not match the preview transform source",
+                "geometry.frame_size",
+            )
+        return VideoGeometry(
+            self.preview_frame_size,
+            self.map_point(geometry.base_point, "base_point"),
+            None
+            if geometry.initial_tip_point is None
+            else self.map_point(geometry.initial_tip_point, "initial_tip_point"),
+            self.map_roi(geometry.actuator_roi, "actuator_roi"),
+        )
+
+
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool) and isfinite(value)

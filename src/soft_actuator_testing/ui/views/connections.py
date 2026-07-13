@@ -61,18 +61,20 @@ class SerialControlPanel(QWidget):
         layout.addLayout(buttons)
 
         legacy = QHBoxLayout()
-        self.start_button = AccessibleButton("Send legacy start", parent=self)
+        self.start_button = AccessibleButton("Run start requires readiness", parent=self)
+        self.start_button.setToolTip("CMD:START is blocked here. Use Live Run after readiness and camera proof.")
         self.stop_button = AccessibleButton("Send legacy stop", parent=self)
         self.calibration_on_button = AccessibleButton("Enable legacy calibration", parent=self)
         self.calibration_off_button = AccessibleButton("Disable legacy calibration", parent=self)
         for button, callback in (
-            (self.start_button, self.controller.start_legacy_run),
             (self.stop_button, self.controller.stop_legacy_run),
             (self.calibration_on_button, lambda: self.controller.set_legacy_calibration_streaming(True)),
             (self.calibration_off_button, lambda: self.controller.set_legacy_calibration_streaming(False)),
         ):
             button.clicked.connect(callback)
             legacy.addWidget(button)
+        self.start_button.setEnabled(False)
+        legacy.addWidget(self.start_button)
         layout.addLayout(legacy)
         self.profile_note = QLabel(self)
         self.profile_note.setObjectName("serial-profile-note")
@@ -123,10 +125,14 @@ class SerialControlPanel(QWidget):
         self.connect_button.setEnabled(snapshot.status is not SerialConnectionStatus.CONNECTED)
         self.disconnect_button.setEnabled(snapshot.status is SerialConnectionStatus.CONNECTED)
         commands_enabled = snapshot.status is SerialConnectionStatus.CONNECTED
-        for button in (self.start_button, self.stop_button, self.calibration_on_button, self.calibration_off_button):
+        for button in (self.stop_button, self.calibration_on_button, self.calibration_off_button):
             button.setEnabled(commands_enabled)
+        self.start_button.setEnabled(False)
         unconfirmed = " Field mapping is unconfirmed and configurable." if snapshot.profile_is_unconfirmed else ""
-        self.profile_note.setText(f"Parser profile: {snapshot.profile_name}.{unconfirmed}")
+        self.profile_note.setText(
+            f"Parser profile: {snapshot.profile_name}.{unconfirmed} "
+            "CMD:START is blocked here; use Live Run after readiness and camera proof."
+        )
         self.diagnostics.setPlainText(snapshot.diagnostic_text)
 
     def _shutdown(self, *_: object) -> None:

@@ -1,0 +1,2 @@
+schema_version,artifact_id,frame_index,video_time_seconds,tip_x,tip_y,actuator_angle_degrees,detection_state,confidence,correction_applied,legacy_import
+1,analysis_prior_v1,0,0.0,140.0,36.0,-26.565051,detected,0.9,false,false

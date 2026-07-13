@@ -3,6 +3,11 @@
 Per ADR 0001, PyQtGraph is used only behind this project-owned widget — no
 presenter or domain/application code imports ``pyqtgraph`` directly. Series
 colors and grid/axis colors come only from :mod:`soft_actuator_testing.ui.themes.tokens`.
+
+Because a plot's visible data cannot be conveyed by a screen reader from the
+rendered curves alone, this widget keeps an always-current text
+``accessibleDescription`` summarizing the plotted series and point counts,
+mirroring the pattern used by :class:`~soft_actuator_testing.ui.widgets.video_canvas.VideoCanvas`.
 """
 
 from __future__ import annotations
@@ -35,14 +40,16 @@ class PlotCanvas(pg.PlotWidget):
         super().__init__(parent=parent)
         self._curves: dict[str, pg.PlotDataItem] = {}
         self._theme: Theme | None = None
+        self._title = title or "Plot"
         self.showGrid(x=True, y=True, alpha=0.3)
-        self.setAccessibleName(title or "Plot")
+        self.setAccessibleName(self._title)
         if title:
             self.setTitle(title)
         if x_label:
             self.setLabel("bottom", x_label)
         if y_label:
             self.setLabel("left", y_label)
+        self._update_accessible_description()
 
     def apply_theme(self, theme: Theme) -> None:
         self._theme = theme
@@ -74,8 +81,22 @@ class PlotCanvas(pg.PlotWidget):
             self._curves[name] = self.plot(list(x), list(y), pen=color, name=name)
         else:
             self._curves[name].setData(list(x), list(y))
+        self._update_accessible_description()
 
     def clear_series(self) -> None:
         for curve in self._curves.values():
             self.removeItem(curve)
         self._curves.clear()
+        self._update_accessible_description()
+
+    def _update_accessible_description(self) -> None:
+        if not self._curves:
+            text = f"{self._title}: no data plotted yet."
+        else:
+            parts = []
+            for name, curve in self._curves.items():
+                x_data, _ = curve.getData()
+                count = 0 if x_data is None else len(x_data)
+                parts.append(f"{name} ({count} point{'s' if count != 1 else ''})")
+            text = f"{self._title}: " + ", ".join(parts)
+        self.setAccessibleDescription(text)

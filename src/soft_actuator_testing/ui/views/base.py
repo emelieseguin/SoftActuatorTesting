@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import numpy as np
 from PySide6.QtCore import Signal
@@ -14,16 +15,14 @@ from soft_actuator_testing.application.presentation import (
     PresenterSession,
 )
 from soft_actuator_testing.domain.run_state import RunCompletion, RunState
-from soft_actuator_testing.ui.demo import (
-    DemoEnvironment,
-    build_demo_environment,
-    build_demo_presenter,
-)
 from soft_actuator_testing.ui.presenters import bind_view
 from soft_actuator_testing.ui.themes import DARK_THEME, SemanticState, Theme
 from soft_actuator_testing.ui.themes.qt_bridge import apply_theme_to_widget, to_qfont
 from soft_actuator_testing.ui.widgets import AccessibleButton, PlotCanvas, StatusIndicator
 from soft_actuator_testing.ui.widgets.file_picker import FakeFilePicker, FilePicker
+
+if TYPE_CHECKING:
+    from soft_actuator_testing.ui.demo import DemoEnvironment
 
 
 class PageScenario(str, Enum):
@@ -51,6 +50,12 @@ def _resolve_presenter(
     presenter: PresenterSession | DemoEnvironment | None,
     environment: DemoEnvironment | None,
 ) -> tuple[PresenterSession, DemoEnvironment | None]:
+    from soft_actuator_testing.ui.demo import (
+        DemoEnvironment,
+        build_demo_environment,
+        build_demo_presenter,
+    )
+
     source = environment if environment is not None else presenter
     if isinstance(source, PresenterSession):
         return source, environment
@@ -111,10 +116,16 @@ class WorkflowPage(QWidget):
         presenter: PresenterSession | DemoEnvironment | None = None,
         environment: DemoEnvironment | None = None,
         file_picker: FilePicker | None = None,
+        production_mode: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.presenter, self.environment = _resolve_presenter(presenter, environment)
+        self.production_mode = production_mode
+        if production_mode:
+            self.presenter = None
+            self.environment = None
+        else:
+            self.presenter, self.environment = _resolve_presenter(presenter, environment)
         self.file_picker = file_picker or FakeFilePicker()
         self._scenario = PageScenario.READY
         self._state_subscription = None
@@ -148,6 +159,8 @@ class WorkflowPage(QWidget):
 
     @property
     def application_snapshot(self) -> ApplicationSnapshot:
+        if self.presenter is None:
+            raise RuntimeError("production workflow pages do not use demo presenter state")
         return self.presenter.state.snapshot
 
     def set_scenario(self, scenario: PageScenario) -> None:
@@ -162,6 +175,8 @@ class WorkflowPage(QWidget):
 
     def _bind_presenter(self) -> None:
         self.apply_theme(DARK_THEME)
+        if self.presenter is None:
+            return
         self._state_subscription = bind_view(
             self,
             self.presenter.state,
@@ -172,6 +187,8 @@ class WorkflowPage(QWidget):
         del snapshot
 
     def dispatch(self, command):
+        if self.presenter is None:
+            raise RuntimeError("production workflow pages do not dispatch demo presenter commands")
         return self.presenter.commands.dispatch(command)
 
     def apply_theme(self, theme: Theme) -> None:

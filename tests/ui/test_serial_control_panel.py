@@ -23,6 +23,8 @@ def test_serial_panel_renders_profile_uncertainty(qtbot) -> None:
     panel = SerialControlPanel(controller=SerialController())
     qtbot.addWidget(panel)
     assert panel.profile_note.text().startswith("Parser profile: unconfigured")
+    assert not panel.start_button.isEnabled()
+    assert "CMD:START is blocked" in panel.profile_note.text()
 
 
 def test_serial_publications_from_worker_are_marshaled_to_gui_thread(qtbot) -> None:

@@ -7,15 +7,28 @@ uses; workflow content itself stays in ``ui.views`` so this shell and the
 rejected Experiment Studio prototype exercise the same deterministic pages
 and fake-service bundle (``ui.demo``). Selection does not make the current
 demo state or Stop semantics production-ready. Nothing here touches real
-hardware, a native dialog, or the filesystem — dock-layout save/restore is an
-in-memory demo affordance only, and the "demo scenario switch" only ever calls
-each shared page's existing ``set_scenario`` presentation hook.
+hardware or a native dialog. Demo-mode dock-layout save/restore is an
+in-memory-only affordance (never written to a file); production-mode
+dock-layout save/restore instead persists to one versioned, validated,
+atomically-written on-disk file (see ``PersistedLayoutStore`` below) so it
+survives across separate runs of the application. Either way, layout
+restore only ever replays previously captured Qt window geometry/state — it
+never contacts a device, opens a native dialog, or moves/hides safety
+chrome. The "demo scenario switch" only ever calls each shared page's
+existing ``set_scenario`` presentation hook and is not present in production.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
+import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QByteArray, Qt, QSize, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
@@ -47,17 +60,15 @@ from soft_actuator_testing.application.presentation import (
 )
 from soft_actuator_testing.application.run_controller import RunController
 from soft_actuator_testing.domain.run_state import RunCompletion, RunSnapshot, RunState
-from soft_actuator_testing.ui.demo import (
-    DemoEnvironment,
-    build_demo_controller,
-    build_demo_environment,
-)
 from soft_actuator_testing.ui.presenters import bind_view
 from soft_actuator_testing.ui.themes import DARK_THEME, SemanticState
 from soft_actuator_testing.ui.themes.qt_bridge import apply_theme_to_widget, to_qcolor, to_qfont
 from soft_actuator_testing.ui.views import PAGE_REGISTRY, PageScenario, WorkflowPage, page_for_key
 from soft_actuator_testing.ui.widgets import AccessibleButton, PlotCanvas, StatusIndicator
-from soft_actuator_testing.ui.widgets.file_picker import FakeFilePicker, FilePicker
+from soft_actuator_testing.ui.widgets.file_picker import FakeFilePicker, FilePicker, QtFilePicker
+
+if TYPE_CHECKING:
+    from soft_actuator_testing.ui.demo import DemoEnvironment
 
 #: Run states where an active run can/should be interrupted by Global Stop.
 _ACTIVE_RUN_STATES = frozenset({RunState.STARTING, RunState.RUNNING, RunState.STOPPING})
@@ -101,10 +112,107 @@ def _run_semantic_state(snapshot: RunSnapshot) -> SemanticState:
 
 @dataclass(frozen=True)
 class LayoutSnapshot:
-    """An in-memory dock/toolbar layout capture; never written to a real file."""
+    """One captured dock/toolbar layout (Qt geometry + window-state bytes)."""
 
     geometry: bytes
     state: bytes
+
+
+_LAYOUT_SCHEMA_VERSION = 1
+
+
+class PersistedLayoutStore:
+    """Versioned, validated, atomically-written on-disk layout persistence.
+
+    Used only by the production Console's Save/Restore layout actions; demo
+    mode keeps its separate in-memory-only ``save_demo_layout``/
+    ``restore_demo_layout`` behavior unchanged. ``load``/``save`` only ever
+    read or write the two opaque Qt geometry/state byte blobs captured by
+    :meth:`InstrumentConsoleWindow.capture_layout`; neither ever contacts a
+    device, opens a native dialog, or moves/hides safety chrome.
+    """
+
+    schema_version = _LAYOUT_SCHEMA_VERSION
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> LayoutSnapshot | None:
+        """Return a validated snapshot, or ``None`` if absent/corrupt/unsupported.
+
+        A missing, corrupt, or schema-mismatched file is treated as a safe
+        "nothing saved yet" result rather than raising, so the caller can fall
+        back to the current on-screen (safe default) layout.
+        """
+
+        if not self.path.is_file():
+            return None
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("schema_version") != self.schema_version:
+                return None
+            geometry = base64.b64decode(payload["geometry"], validate=True)
+            state = base64.b64decode(payload["state"], validate=True)
+            if not geometry or not state:
+                return None
+            return LayoutSnapshot(geometry=geometry, state=state)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, binascii.Error):
+            return None
+
+    def save(self, snapshot: LayoutSnapshot) -> None:
+        """Atomically persist a versioned snapshot. Never touches hardware/services."""
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": self.schema_version,
+            "geometry": base64.b64encode(snapshot.geometry).decode("ascii"),
+            "state": base64.b64encode(snapshot.state).decode("ascii"),
+        }
+        temporary: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
+def default_console_layout_path() -> Path:
+    """The current user's native, current-directory-independent layout file path."""
+
+    if os.name == "nt":
+        app_data = os.environ.get("APPDATA")
+        root = Path(app_data).expanduser() if app_data else Path.home() / "AppData" / "Roaming"
+        return (root / "SoftActuatorTesting" / "console-layout.json").resolve()
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return (root / "soft-actuator-testing" / "console-layout.json").resolve()
+
+
+@dataclass(frozen=True)
+class ProductionConsoleStatus:
+    """The production composition's current non-demo workflow context."""
+
+    workspace: Path | None
+    calibration_ready: bool
+    geometry_ready: bool
+    serial_connected: bool
+    camera_selected: bool
+    analysis_source: Path | None = None
+    analysis_message: str = "No finalized recording is available for analysis."
 
 
 class InstrumentConsoleWindow(QMainWindow):
@@ -126,19 +234,46 @@ class InstrumentConsoleWindow(QMainWindow):
         file_picker: FilePicker | None = None,
         scenario: PageScenario = PageScenario.READY,
         production_run: RunController | None = None,
+        production_pages: Mapping[str, QWidget] | None = None,
+        production_status: Callable[[], ProductionConsoleStatus] | None = None,
+        production_check_readiness: Callable[[], None] | None = None,
+        production_close: Callable[[], None] | None = None,
+        layout_store: PersistedLayoutStore | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.environment = environment or build_demo_environment()
+        self._production_mode = production_pages is not None
+        if self._production_mode and production_run is None:
+            raise ValueError("production pages require a production run controller")
+        if self._production_mode and production_status is None:
+            raise ValueError("production pages require a production status provider")
+        # Demo mode never persists to disk (see save_demo_layout/restore_demo_layout);
+        # production mode defaults to the real per-user config path but accepts an
+        # injected store so tests never touch a real user's configuration file.
+        self._layout_store: PersistedLayoutStore | None = layout_store
+        if self._layout_store is None and self._production_mode:
+            self._layout_store = PersistedLayoutStore(default_console_layout_path())
+        if self._production_mode:
+            self.environment = None
+        else:
+            from soft_actuator_testing.ui.demo import build_demo_environment
+
+            self.environment = environment or build_demo_environment()
         self._demo_controller = None
-        if presenter is None:
+        if not self._production_mode and presenter is None:
+            from soft_actuator_testing.ui.demo import build_demo_controller
+
             self._demo_controller = build_demo_controller(self.environment)
             presenter = self._demo_controller.session()
         self.presenter = presenter
         self.production_run = production_run
-        self.file_picker = file_picker or FakeFilePicker()
+        self._production_status = production_status
+        self._production_check_readiness = production_check_readiness
+        self._production_close = production_close
+        self.file_picker = file_picker or (QtFilePicker(self) if self._production_mode else FakeFilePicker())
         self._scenario = PageScenario(scenario)
-        self._pages: dict[str, WorkflowPage] = {}
+        self._production_pages = dict(production_pages or {})
+        self._pages: dict[str, QWidget] = {}
         self._nav_actions: dict[str, QAction] = {}
         self._nav_buttons: dict[str, QWidget] = {}
         self._current_key = "home"
@@ -156,7 +291,11 @@ class InstrumentConsoleWindow(QMainWindow):
 
         self.status_bar = self.statusBar()
         self.status_bar.setObjectName("console-status-bar")
-        self.status_bar.showMessage("Demo mode — deterministic services only; no hardware connected.")
+        self.status_bar.showMessage(
+            "Production mode — hardware is disconnected until an operator explicitly connects it."
+            if self._production_mode
+            else "Demo mode — deterministic services only; no hardware connected."
+        )
 
         nav_toolbar = self._build_navigation_toolbar()
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, nav_toolbar)
@@ -181,14 +320,20 @@ class InstrumentConsoleWindow(QMainWindow):
 
         self._build_menus()
 
-        self.apply_demo_scenario(self._scenario)
+        if not self._production_mode:
+            self.apply_demo_scenario(self._scenario)
         self.navigate_to("home")
-        self._state_subscription = bind_view(
-            self,
-            self.presenter.state,
-            self.render_snapshot,
-        )
-        self.log_event("Instrument Console demo window ready; no hardware was contacted.")
+        self._state_subscription = None
+        if not self._production_mode:
+            assert self.presenter is not None
+            self._state_subscription = bind_view(
+                self,
+                self.presenter.state,
+                self.render_snapshot,
+            )
+            self.log_event("Instrument Console demo window ready; no hardware was contacted.")
+        else:
+            self.log_event("Instrument Console production window ready; no hardware was contacted.")
         self._production_timer: QTimer | None = None
         if self.production_run is not None:
             # Worker-owned coordinator state is read by this GUI-thread timer;
@@ -206,7 +351,7 @@ class InstrumentConsoleWindow(QMainWindow):
         return self._current_key
 
     @property
-    def pages(self) -> dict[str, WorkflowPage]:
+    def pages(self) -> dict[str, QWidget]:
         """The one shared page instance per registry key."""
 
         return dict(self._pages)
@@ -281,23 +426,24 @@ class InstrumentConsoleWindow(QMainWindow):
             strip.addWidget(indicator)
         strip.addSeparator()
 
-        strip.addWidget(QLabel("Demo state:", strip))
-        self.scenario_switch = QComboBox(strip)
-        self.scenario_switch.setObjectName("console-scenario-switch")
-        self.scenario_switch.setAccessibleName("Demo-only scenario switch")
-        self.scenario_switch.setAccessibleDescription(
-            "Apply an explicit empty, loading, ready, running, completed, or fault "
-            "evaluation state to every workflow page at once."
-        )
-        for scenario in PageScenario:
-            self.scenario_switch.addItem(scenario.value.title(), scenario)
-        self.scenario_switch.currentIndexChanged.connect(self._scenario_switch_changed)
-        strip.addWidget(self.scenario_switch)
-        strip.addSeparator()
+        if not self._production_mode:
+            strip.addWidget(QLabel("Demo state:", strip))
+            self.scenario_switch = QComboBox(strip)
+            self.scenario_switch.setObjectName("console-scenario-switch")
+            self.scenario_switch.setAccessibleName("Demo-only scenario switch")
+            self.scenario_switch.setAccessibleDescription(
+                "Apply an explicit empty, loading, ready, running, completed, or fault "
+                "evaluation state to every workflow page at once."
+            )
+            for scenario in PageScenario:
+                self.scenario_switch.addItem(scenario.value.title(), scenario)
+            self.scenario_switch.currentIndexChanged.connect(self._scenario_switch_changed)
+            strip.addWidget(self.scenario_switch)
+            strip.addSeparator()
 
         self.stop_button = AccessibleButton(
             "⏹ STOP",
-            accessible_description="Immediately stop the active demo run. Shortcut: Ctrl+Shift+S.",
+            accessible_description=self._stop_description(active=False),
             variant="danger",
         )
         self.stop_button.setObjectName("global-stop-button")
@@ -314,7 +460,7 @@ class InstrumentConsoleWindow(QMainWindow):
 
         self.stop_action = QAction("Global Stop (Ctrl+Shift+S)", self)
         self.stop_action.setObjectName("global-stop-action")
-        self.stop_action.setStatusTip("Immediately stop the active demo run (Ctrl+Shift+S)")
+        self.stop_action.setStatusTip(self._stop_status_tip(active=False))
         self.stop_action.triggered.connect(self.trigger_global_stop)
         self.addAction(self.stop_action)
         self.stop_shortcut = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
@@ -322,10 +468,15 @@ class InstrumentConsoleWindow(QMainWindow):
         self.stop_shortcut.activated.connect(self.trigger_global_stop)
 
         strip.addSeparator()
-        demo_label = QLabel("DEMO • fake services only • no hardware", strip)
-        demo_label.setObjectName("demo-mode-label")
-        demo_label.setAccessibleName("Demo mode: deterministic services, no hardware")
-        strip.addWidget(demo_label)
+        mode_label = (
+            "PRODUCTION • disconnected services • operator connection required"
+            if self._production_mode
+            else "DEMO • fake services only • no hardware"
+        )
+        mode = QLabel(mode_label, strip)
+        mode.setObjectName("production-mode-label" if self._production_mode else "demo-mode-label")
+        mode.setAccessibleName(mode_label)
+        strip.addWidget(mode)
         return strip
 
     def _build_central_stack(self) -> None:
@@ -333,10 +484,16 @@ class InstrumentConsoleWindow(QMainWindow):
         self.stack.setObjectName("console-workspace-stack")
         self.stack.setAccessibleName("Workspace")
         for metadata in PAGE_REGISTRY:
-            page = metadata.factory(self.presenter, self.file_picker, self.stack)
-            page.scenario_changed.connect(
-                lambda scenario, key=metadata.key: self._on_page_scenario_changed(key, scenario)
-            )
+            if self._production_mode:
+                page = self._production_pages.get(metadata.key)
+                if page is None:
+                    raise ValueError(f"production composition omitted {metadata.key!r} page")
+                page.setParent(self.stack)
+            else:
+                page = metadata.factory(self.presenter, self.file_picker, self.stack)
+                page.scenario_changed.connect(
+                    lambda scenario, key=metadata.key: self._on_page_scenario_changed(key, scenario)
+                )
             self._pages[metadata.key] = page
             self.stack.addWidget(page)
         self.setCentralWidget(self.stack)
@@ -355,13 +512,17 @@ class InstrumentConsoleWindow(QMainWindow):
 
     def _build_telemetry_dock(self) -> QDockWidget:
         dock = self._new_dock("Telemetry", "dock-telemetry")
+        telemetry_title = (
+            "Pressure telemetry (kPa)" if self._production_mode else "Demo pressure telemetry (kPa)"
+        )
         self.telemetry_plot = PlotCanvas(
-            title="Demo pressure telemetry (kPa)", x_label="Time (s)", y_label="Pressure (kPa)", parent=dock
+            title=telemetry_title, x_label="Time (s)", y_label="Pressure (kPa)", parent=dock
         )
         self.telemetry_plot.setObjectName("telemetry-plot")
         self.telemetry_plot.apply_theme(DARK_THEME)
         dock.setWidget(self.telemetry_plot)
-        self._refresh_telemetry()
+        if not self._production_mode:
+            self._refresh_telemetry()
         return dock
 
     def _build_event_log_dock(self) -> QDockWidget:
@@ -449,10 +610,12 @@ class InstrumentConsoleWindow(QMainWindow):
             button.apply_theme(DARK_THEME)
             layout.addWidget(button)
 
-        note = QLabel(
-            "Quick access to the Live Run page's demo actions; the Live Run page reflects the same state.",
-            content,
+        note_text = (
+            "Quick access to the Live Run page's run actions; the Live Run page reflects the same state."
+            if self._production_mode
+            else "Quick access to the Live Run page's demo actions; the Live Run page reflects the same state."
         )
+        note = QLabel(note_text, content)
         note.setWordWrap(True)
         note.setAccessibleName("Run control note")
         layout.addWidget(note)
@@ -470,24 +633,43 @@ class InstrumentConsoleWindow(QMainWindow):
             view_menu.addAction(dock.toggleViewAction())
         view_menu.addSeparator()
 
-        self.save_layout_action = QAction("Save demo layout (Ctrl+Shift+L)", self)
-        self.save_layout_action.setObjectName("save-layout-action")
-        self.save_layout_action.setStatusTip("Save the current dock/toolbar arrangement in memory only")
-        self.save_layout_action.triggered.connect(self.save_demo_layout)
+        if self._production_mode:
+            self.save_layout_action = QAction("Save layout (Ctrl+Shift+L)", self)
+            self.save_layout_action.setObjectName("save-layout-action")
+            self.save_layout_action.setStatusTip(
+                "Save the current dock/toolbar arrangement to a versioned on-disk file; never contacts hardware."
+            )
+            self.save_layout_action.triggered.connect(self.save_layout)
+        else:
+            self.save_layout_action = QAction("Save demo layout (Ctrl+Shift+L)", self)
+            self.save_layout_action.setObjectName("save-layout-action")
+            self.save_layout_action.setStatusTip("Save the current dock/toolbar arrangement in memory only")
+            self.save_layout_action.triggered.connect(self.save_demo_layout)
         self.addAction(self.save_layout_action)
         self.save_layout_shortcut = QShortcut(QKeySequence("Ctrl+Shift+L"), self)
-        self.save_layout_shortcut.activated.connect(self.save_demo_layout)
+        self.save_layout_shortcut.activated.connect(self.save_layout_action.trigger)
         view_menu.addAction(self.save_layout_action)
 
-        self.restore_layout_action = QAction("Restore demo layout (Ctrl+Shift+R)", self)
-        self.restore_layout_action.setObjectName("restore-layout-action")
-        self.restore_layout_action.setStatusTip("Restore the last saved in-memory dock/toolbar arrangement")
-        self.restore_layout_action.triggered.connect(self.restore_demo_layout)
+        if self._production_mode:
+            self.restore_layout_action = QAction("Restore layout (Ctrl+Shift+R)", self)
+            self.restore_layout_action.setObjectName("restore-layout-action")
+            self.restore_layout_action.setStatusTip(
+                "Restore the last saved on-disk dock/toolbar arrangement, or keep the current safe "
+                "on-screen layout if none is saved or valid; never contacts hardware."
+            )
+            self.restore_layout_action.triggered.connect(self.restore_layout)
+        else:
+            self.restore_layout_action = QAction("Restore demo layout (Ctrl+Shift+R)", self)
+            self.restore_layout_action.setObjectName("restore-layout-action")
+            self.restore_layout_action.setStatusTip("Restore the last saved in-memory dock/toolbar arrangement")
+            self.restore_layout_action.triggered.connect(self.restore_demo_layout)
         self.addAction(self.restore_layout_action)
         self.restore_layout_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
-        self.restore_layout_shortcut.activated.connect(self.restore_demo_layout)
+        self.restore_layout_shortcut.activated.connect(self.restore_layout_action.trigger)
         view_menu.addAction(self.restore_layout_action)
 
+        if self._production_mode:
+            return
         demo_menu = self.menuBar().addMenu("&Demo")
         demo_menu.setObjectName("menu-demo")
         demo_menu.addAction(self.stop_action)
@@ -563,7 +745,9 @@ class InstrumentConsoleWindow(QMainWindow):
     # -- Status strip / dock refresh --------------------------------------
 
     def _refresh_status_strip(self) -> None:
-        self.render_snapshot(self.presenter.state.snapshot)
+        if not self._production_mode:
+            assert self.presenter is not None
+            self.render_snapshot(self.presenter.state.snapshot)
 
     def render_snapshot(self, snapshot: ApplicationSnapshot) -> None:
         """Render every shell projection from one authoritative snapshot."""
@@ -597,18 +781,42 @@ class InstrumentConsoleWindow(QMainWindow):
         self._refresh_telemetry(snapshot)
         self._refresh_file_context(snapshot)
 
-    def _refresh_stop_button(self, snapshot: RunSnapshot) -> None:
-        active = snapshot.state in _ACTIVE_RUN_STATES
-        self.stop_button.setEnabled(active)
-        self.stop_action.setEnabled(active)
-        description = (
+    def _stop_description(self, *, active: bool) -> str:
+        """Mode-aware accessible description for the Global Stop button."""
+
+        if self._production_mode:
+            return (
+                "Stop the active run immediately. Shortcut: Ctrl+Shift+S."
+                if active
+                else "No active run; Global Stop is idle. Shortcut: Ctrl+Shift+S."
+            )
+        return (
             "Stop the active demo run immediately. Shortcut: Ctrl+Shift+S."
             if active
             else "No active demo run; Global Stop is idle. Shortcut: Ctrl+Shift+S."
         )
-        self.stop_button.setAccessibleDescription(description)
+
+    def _stop_status_tip(self, *, active: bool) -> str:
+        """Mode-aware status-bar tip for the Global Stop action."""
+
+        del active  # reserved for future active-state-specific tips; kept mode-aware today.
+        return (
+            "Immediately stop the active run (Ctrl+Shift+S)"
+            if self._production_mode
+            else "Immediately stop the active demo run (Ctrl+Shift+S)"
+        )
+
+    def _refresh_stop_button(self, snapshot: RunSnapshot) -> None:
+        active = snapshot.state in _ACTIVE_RUN_STATES
+        self.stop_button.setEnabled(active)
+        self.stop_action.setEnabled(active)
+        self.stop_button.setAccessibleDescription(self._stop_description(active=active))
+        self.stop_action.setStatusTip(self._stop_status_tip(active=active))
 
     def _refresh_telemetry(self, snapshot: ApplicationSnapshot | None = None) -> None:
+        if self._production_mode:
+            return
+        assert self.presenter is not None
         current = snapshot or self.presenter.state.snapshot
         if current.run.telemetry:
             self.telemetry_plot.set_series(
@@ -618,6 +826,10 @@ class InstrumentConsoleWindow(QMainWindow):
             )
 
     def _refresh_file_context(self, snapshot: ApplicationSnapshot | None = None) -> None:
+        if self._production_mode:
+            self._refresh_production_context()
+            return
+        assert self.presenter is not None
         current = snapshot or self.presenter.state.snapshot
         self.context_workspace_value.setText(str(current.workspace.path or "No workspace"))
         self.context_calibration_value.setText(current.calibration.fit_summary)
@@ -641,6 +853,12 @@ class InstrumentConsoleWindow(QMainWindow):
     # -- Run control dock actions ------------------------------------------
 
     def _run_control_enable_readiness(self) -> None:
+        if self._production_mode:
+            if self._production_check_readiness is not None:
+                self._production_check_readiness()
+            self._refresh_production_run()
+            return
+        assert self.presenter is not None
         if not self.presenter.state.snapshot.devices.all_connected:
             self.presenter.commands.dispatch(ConnectDevices())
         self.presenter.commands.dispatch(EvaluateReadiness())
@@ -683,7 +901,11 @@ class InstrumentConsoleWindow(QMainWindow):
         self.log_event(f"Global STOP: {result.message}")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self.production_run is not None:
+        if self._production_timer is not None:
+            self._production_timer.stop()
+        if self._production_close is not None:
+            self._production_close()
+        elif self.production_run is not None:
             self.production_run.close()
         super().closeEvent(event)
 
@@ -692,12 +914,15 @@ class InstrumentConsoleWindow(QMainWindow):
 
         assert self.production_run is not None
         snapshot = self.production_run.snapshot
+        self._refresh_production_context()
         semantic = _run_semantic_state(snapshot.lifecycle)
         self.run_status.set_state(semantic)
         self.run_control_status.set_state(semantic)
         active = snapshot.lifecycle.state in _ACTIVE_RUN_STATES
         self.stop_button.setEnabled(active)
         self.stop_action.setEnabled(active)
+        self.stop_button.setAccessibleDescription(self._stop_description(active=active))
+        self.stop_action.setStatusTip(self._stop_status_tip(active=active))
         self.run_control_start.setEnabled(snapshot.readiness.ready and not active)
         self.run_control_stop.setEnabled(active)
         if snapshot.telemetry:
@@ -706,8 +931,68 @@ class InstrumentConsoleWindow(QMainWindow):
                 [point.time_s for point in snapshot.telemetry],
                 [point.pressure_kpa for point in snapshot.telemetry],
             )
+        analysis_page = self._pages.get("analysis")
+        finalization = self.production_run.finalization_result
+        if finalization is not None and hasattr(analysis_page, "receive_finalization"):
+            analysis_page.receive_finalization(finalization)  # type: ignore[union-attr]
 
-    # -- Layout save/restore (demo-only, in-memory) ------------------------
+    def _refresh_production_context(self) -> None:
+        """Render production-owned workflow context without demo presenter state."""
+
+        if self._production_status is None:
+            return
+        context = self._production_status()
+        self.connection_status.set_state(
+            SemanticState.SUCCESS if context.serial_connected else SemanticState.NEUTRAL
+        )
+        self.calibration_status.set_state(
+            SemanticState.SUCCESS if context.calibration_ready else SemanticState.NEUTRAL
+        )
+        self.camera_status.set_state(
+            SemanticState.SUCCESS if context.camera_selected else SemanticState.NEUTRAL
+        )
+        self.storage_status.set_state(
+            SemanticState.SUCCESS if context.workspace is not None else SemanticState.NEUTRAL
+        )
+        self.fault_status.set_state(SemanticState.NEUTRAL)
+        self.context_workspace_value.setText(str(context.workspace or "No workspace"))
+        self.context_calibration_value.setText(
+            "Validated calibration available" if context.calibration_ready else "Calibration requires a validated fit"
+        )
+        self.context_geometry_value.setText(
+            "Complete geometry available" if context.geometry_ready else "Geometry requires base, tip, and ROI"
+        )
+        self.context_analysis_value.setText(str(context.analysis_source or context.analysis_message))
+        self.context_run_value.setText(self.production_run.snapshot.lifecycle.state.value)
+        missing = [
+            label
+            for label, available in (
+                ("workspace", context.workspace is not None),
+                ("calibration", context.calibration_ready),
+                ("geometry", context.geometry_ready),
+                ("serial connection", context.serial_connected),
+            )
+            if not available
+        ]
+        self.readiness_guidance.setText(
+            "Ready to evaluate cyclic run prerequisites."
+            if not missing
+            else "Complete: " + ", ".join(missing) + "."
+        )
+        self.next_action_value.setText(
+            "Use Check readiness after completing the required workflow pages."
+        )
+        self.diagnostics_detail.setText(context.analysis_message)
+
+    # -- Layout save/restore --------------------------------------------------
+    #
+    # Demo mode: in-memory only (save_demo_layout/restore_demo_layout), never
+    # written to a file, matching the shared-prototype-comparison intent.
+    # Production mode: versioned, validated, atomically-written to disk via
+    # ``self._layout_store`` (save_layout/restore_layout) so it survives across
+    # separate runs of the application. Both only ever replay previously
+    # captured Qt geometry/state bytes; neither ever contacts a device, opens
+    # a native dialog, or moves/hides safety chrome.
 
     def capture_layout(self) -> LayoutSnapshot:
         return LayoutSnapshot(geometry=bytes(self.saveGeometry().data()), state=bytes(self.saveState().data()))
@@ -733,9 +1018,53 @@ class InstrumentConsoleWindow(QMainWindow):
         self.log_event("Demo dock layout restored from the in-memory snapshot.")
         self.status_bar.showMessage("Layout restored (demo/in-memory only).", 4000)
 
+    def save_layout(self) -> None:
+        """Persist the current dock/toolbar layout to a versioned on-disk file.
+
+        Production-only. Never touches hardware/services; see
+        ``save_demo_layout`` for the separate in-memory-only demo affordance.
+        """
+
+        assert self._layout_store is not None
+        snapshot = self.capture_layout()
+        self._layout_store.save(snapshot)
+        self._saved_layout = snapshot
+        self.log_event("Console layout saved to disk (versioned; no hardware was contacted).")
+        self.status_bar.showMessage("Layout saved.", 4000)
+
+    def restore_layout(self) -> None:
+        """Restore the last validated on-disk layout, or keep the safe on-screen default.
+
+        Production-only. Never touches hardware/services; an absent, corrupt,
+        or otherwise invalid saved file safely leaves the current on-screen
+        layout unchanged rather than raising.
+        """
+
+        assert self._layout_store is not None
+        snapshot = self._layout_store.load()
+        if snapshot is None:
+            self.log_event(
+                "Restore layout requested; no valid saved layout was found; keeping the current on-screen layout."
+            )
+            self.status_bar.showMessage("No valid saved layout found; keeping the current layout.", 4000)
+            return
+        if not self.apply_layout(snapshot):
+            self.log_event("Saved layout failed validation; keeping the current on-screen layout.")
+            self.status_bar.showMessage("Saved layout was invalid; keeping the current layout.", 4000)
+            return
+        self._saved_layout = snapshot
+        self.log_event("Console layout restored from disk (no hardware was contacted).")
+        self.status_bar.showMessage("Layout restored.", 4000)
+
     @property
     def saved_layout(self) -> LayoutSnapshot | None:
         return self._saved_layout
+
+    @property
+    def layout_store(self) -> PersistedLayoutStore | None:
+        """The production layout store, or ``None`` in demo mode."""
+
+        return self._layout_store
 
     # -- Full simulated workflow walkthrough --------------------------------
 
@@ -787,6 +1116,11 @@ def create_instrument_console_shell(
     file_picker: FilePicker | None = None,
     scenario: PageScenario = PageScenario.READY,
     production_run: RunController | None = None,
+    production_pages: Mapping[str, QWidget] | None = None,
+    production_status: Callable[[], ProductionConsoleStatus] | None = None,
+    production_check_readiness: Callable[[], None] | None = None,
+    production_close: Callable[[], None] | None = None,
+    layout_store: PersistedLayoutStore | None = None,
     parent: QWidget | None = None,
 ) -> InstrumentConsoleWindow:
     """Build the selected normal shell with deterministic demo-only boundaries."""
@@ -797,6 +1131,11 @@ def create_instrument_console_shell(
         file_picker=file_picker,
         scenario=scenario,
         production_run=production_run,
+        production_pages=production_pages,
+        production_status=production_status,
+        production_check_readiness=production_check_readiness,
+        production_close=production_close,
+        layout_store=layout_store,
         parent=parent,
     )
 

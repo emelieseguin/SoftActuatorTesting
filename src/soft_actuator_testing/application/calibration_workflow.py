@@ -25,7 +25,7 @@ from soft_actuator_testing.domain.calibration import (
     fit_calibration,
 )
 from soft_actuator_testing.domain.errors import CalibrationError, ErrorCode
-from soft_actuator_testing.infrastructure.serial_adapter import ErrorFrame, TelemetryFrame
+from soft_actuator_testing.infrastructure.serial_adapter import ErrorFrame, SerialFrameSubscription, TelemetryFrame
 
 
 @dataclass(frozen=True)
@@ -138,9 +138,9 @@ class SerialCalibrationSampleSource:
         self._clock = clock
         self._sleeper = sleeper
         self._sequence = 0
+        self._subscription_name = f"calibration-freshness-{id(self):x}"
 
     def current_sequence(self) -> int:
-        self._consume_frames()
         return self._sequence
 
     def request_after(
@@ -160,27 +160,68 @@ class SerialCalibrationSampleSource:
         timeout = self._capture_timeout_seconds if timeout_seconds is None else timeout_seconds
         if timeout <= 0:
             raise ValueError("capture timeout must be positive")
-        self._controller.set_legacy_calibration_streaming(True)
-        deadline = self._clock() + timeout
+        primary_error: Exception | None = None
+        subscription: SerialFrameSubscription | None = None
         try:
+            subscription = self._controller.subscribe_frames(self._subscription_name, critical=True)
+            self._require_streaming_receipt(
+                self._controller.set_legacy_calibration_streaming(True),
+                "CMD:CAL_ON",
+            )
+            # This dedicated stream is subscribed before CAL_ON, then drained
+            # once the command is sent. Only a later dispatched row can satisfy
+            # this capture; diagnostics and run persistence cannot consume it.
+            self._consume_frames(subscription)
+            fresh_after = self._sequence
+            deadline = self._clock() + timeout
             while True:
                 if cancellation is not None and cancellation.is_cancelled():
                     raise CalibrationCaptureCancelled()
-                measurement = self._consume_frames(after=sequence)
+                measurement = self._consume_frames(subscription, after=fresh_after)
                 if measurement is not None:
                     return measurement
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     raise CalibrationCaptureTimeout(timeout)
                 self._sleeper(min(self._poll_interval_seconds, remaining))
+        except Exception as error:
+            primary_error = error
+            raise
         finally:
             # CAL_OFF is issued for success, timeout, cancellation, and faults.
-            self._controller.set_legacy_calibration_streaming(False)
+            try:
+                self._require_streaming_receipt(
+                    self._controller.set_legacy_calibration_streaming(False),
+                    "CMD:CAL_OFF",
+                )
+            except Exception as error:
+                detail = f"CAL_OFF cleanup failed: {error}"
+                if primary_error is not None:
+                    detail = f"{primary_error}; {detail}"
+                raise CalibrationCaptureFault(detail) from error
+            finally:
+                if subscription is not None:
+                    subscription.close()
 
-    def _consume_frames(self, *, after: int | None = None) -> CalibrationMeasurement | None:
+    @staticmethod
+    def _require_streaming_receipt(receipt: object, command: str) -> None:
+        state = getattr(receipt, "state", None)
+        value = getattr(state, "value", state)
+        if value not in {"sent", "acknowledged"}:
+            detail = getattr(receipt, "detail", "")
+            raise CalibrationCaptureFault(
+                f"{command} was not sent successfully: {value or 'no receipt'} {detail}".strip()
+            )
+
+    def _consume_frames(
+        self,
+        subscription: SerialFrameSubscription,
+        *,
+        after: int | None = None,
+    ) -> CalibrationMeasurement | None:
         measurement: CalibrationMeasurement | None = None
-        for frame in self._controller.poll():
-            if isinstance(frame, ErrorFrame) and frame.source in {"read", "write", "shutdown"}:
+        for frame in subscription.drain():
+            if isinstance(frame, ErrorFrame) and frame.source in {"read", "write", "shutdown", "close", "disconnect"}:
                 raise CalibrationCaptureFault(frame.message)
             if not isinstance(frame, TelemetryFrame):
                 continue

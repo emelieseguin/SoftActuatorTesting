@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from math import isfinite
+from numbers import Real
 
 import numpy as np
 
@@ -62,6 +63,12 @@ class CalibrationModel:
     output_unit: Unit = Unit.KILOPASCAL
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_type, CalibrationModelType):
+            raise CalibrationError(
+                ErrorCode.CALIBRATION_INVALID,
+                "model_type must be linear or quadratic",
+                "model.type",
+            )
         expected = 2 if self.model_type is CalibrationModelType.LINEAR else 3
         if len(self.coefficients) != expected:
             raise CalibrationError(
@@ -255,7 +262,7 @@ def apply_calibration(model: CalibrationModel, voltage: float) -> float:
 
 
 def _require_finite(value: float, field_path: str) -> None:
-    if not isfinite(value):
+    if not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value):
         raise CalibrationError(
             ErrorCode.NON_FINITE_VALUE,
             "value must be finite",

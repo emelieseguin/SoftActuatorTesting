@@ -36,6 +36,14 @@ class FilePicker(Protocol):
         filters: tuple[FileFilter, ...] = (),
     ) -> Path | None: ...
 
+    def get_open_files(
+        self,
+        *,
+        caption: str,
+        directory: Path | None = None,
+        filters: tuple[FileFilter, ...] = (),
+    ) -> tuple[Path, ...]: ...
+
     def get_save_file(
         self,
         *,
@@ -72,6 +80,21 @@ class QtFilePicker:
             self._parent, caption, str(directory or ""), filter_string
         )
         return Path(path) if path else None
+
+    def get_open_files(
+        self,
+        *,
+        caption: str,
+        directory: Path | None = None,
+        filters: tuple[FileFilter, ...] = (),
+    ) -> tuple[Path, ...]:
+        from PySide6.QtWidgets import QFileDialog
+
+        filter_string = ";;".join(f.to_qt_filter() for f in filters)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self._parent, caption, str(directory or ""), filter_string
+        )
+        return tuple(Path(path) for path in paths if path)
 
     def get_save_file(
         self,
@@ -114,18 +137,27 @@ class RecordedFilePickerCall:
 class FakeFilePicker:
     """A deterministic, non-dialog-opening double for tests.
 
-    ``queued_results`` is consumed in FIFO order across all three methods so
-    a test scenario can script a sequence of picker outcomes (including
-    ``None`` for "user cancelled").
+    ``queued_results`` is consumed in FIFO order across
+    ``get_open_file``/``get_save_file``/``get_existing_directory`` so a test
+    scenario can script a sequence of picker outcomes (including ``None`` for
+    "user cancelled"). ``queued_multi_results`` is a separate FIFO queue used
+    only by ``get_open_files`` (empty tuple means "user selected nothing /
+    cancelled").
     """
 
     queued_results: list[Path | None] = field(default_factory=list)
+    queued_multi_results: list[tuple[Path, ...]] = field(default_factory=list)
     calls: list[RecordedFilePickerCall] = field(default_factory=list, init=False)
 
     def _next_result(self) -> Path | None:
         if not self.queued_results:
             return None
         return self.queued_results.pop(0)
+
+    def _next_multi_result(self) -> tuple[Path, ...]:
+        if not self.queued_multi_results:
+            return ()
+        return self.queued_multi_results.pop(0)
 
     def get_open_file(
         self,
@@ -136,6 +168,16 @@ class FakeFilePicker:
     ) -> Path | None:
         self.calls.append(RecordedFilePickerCall("get_open_file", caption, directory, filters))
         return self._next_result()
+
+    def get_open_files(
+        self,
+        *,
+        caption: str,
+        directory: Path | None = None,
+        filters: tuple[FileFilter, ...] = (),
+    ) -> tuple[Path, ...]:
+        self.calls.append(RecordedFilePickerCall("get_open_files", caption, directory, filters))
+        return self._next_multi_result()
 
     def get_save_file(
         self,

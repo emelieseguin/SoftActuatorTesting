@@ -5,13 +5,23 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from threading import Event, Thread
 from time import sleep
 
 import pytest
 
-from soft_actuator_testing.application.camera_capture import CaptureHealth, CaptureResult, TARGET_4K60
+from soft_actuator_testing.application.camera_capture import (
+    CameraMode,
+    CaptureEvidence,
+    CaptureHealth,
+    CapturePhase,
+    CaptureResult,
+    LatestFrameStats,
+    NegotiatedCaptureProfile,
+    TARGET_4K60,
+)
 from soft_actuator_testing.application.run_controller import CyclicRunConfiguration, RunController
 from soft_actuator_testing.domain.calibration import (
     CalibrationFit,
@@ -39,6 +49,20 @@ class _SerialSnapshot:
 @dataclass(frozen=True)
 class _Profile:
     name: str = "legacy-field-3-unconfirmed"
+
+
+class _FakeFrameSubscription:
+    def __init__(self, serial: "FakeSerial") -> None:
+        self._serial = serial
+        self.closed = False
+
+    def drain(self) -> tuple[object, ...]:
+        result = tuple(self._serial.frames)
+        self._serial.frames.clear()
+        return result
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeSerial:
@@ -78,6 +102,9 @@ class FakeSerial:
             raise RuntimeError("injected stop failure")
         return self._receipt("CMD:STOP")
 
+    def subscribe_frames(self, *_args: object, **_kwargs: object) -> _FakeFrameSubscription:
+        return _FakeFrameSubscription(self)
+
     def poll(self, maximum: int | None = None) -> tuple[object, ...]:
         result = tuple(self.frames)
         self.frames.clear()
@@ -107,6 +134,131 @@ class FakeCamera:
         video = self.started[-1][0] / "video.mkv"
         video.write_bytes(b"fake-video")
         return CaptureResult(reason, video, video, True, True, self.health)
+
+
+class EvidenceCamera(FakeCamera):
+    """Fake camera exposing the complete public capture-evidence contract."""
+
+    def __init__(
+        self,
+        *,
+        clean: bool = True,
+        readable: bool = True,
+        promoted: bool = True,
+        error: str = "",
+        retain_partial: bool = True,
+    ) -> None:
+        evidence = CaptureEvidence(
+            startup_proven=True,
+            cooperative_shutdown=True,
+            process_exit_code=0,
+            drainers_stopped=True,
+            verification_readable=readable,
+            promoted=promoted,
+            shutdown_escalated=False,
+        )
+        health = CaptureHealth(
+            phase=CapturePhase.RECORDING,
+            frame=240,
+            fps=59.94,
+            speed=1.01,
+            output_time_us=4_000_000,
+            output_bytes=12_345_678,
+            duplicate_frames=2,
+            dropped_frames=3,
+            malformed_progress_lines=1,
+            negotiated_profile=NegotiatedCaptureProfile(3840, 2160, 60.0, "nv12", "rawvideo"),
+            encoder="h264_nvenc",
+            preview=LatestFrameStats(produced=40, consumed=12, replaced_stale=28, maximum_age_seconds=0.1),
+            warnings=("capture warning",),
+            ready=True,
+            evidence=evidence,
+        )
+        super().__init__()
+        self.health = health
+        self.clean = clean
+        self.readable = readable
+        self.promoted = promoted
+        self.error = error
+        self.retain_partial = retain_partial
+        self.result: CaptureResult | None = None
+        self.backend = "v4l2"
+        self.input_mode = CameraMode(3840, 2160, 60.0, "nv12")
+        self.ffmpeg_version = "ffmpeg version 7.1"
+        self.ffmpeg_build = "test build"
+        self.command: tuple[str, ...] = ()
+
+    def stop_capture(self, reason: str) -> CaptureResult:
+        self.stops += 1
+        directory = self.started[-1][0]
+        partial = directory / "video.partial.mkv"
+        video = directory / "video.mkv"
+        if self.clean and self.promoted:
+            video.write_bytes(b"finalized-video")
+            video_path: Path | None = video
+        elif self.retain_partial:
+            partial.write_bytes(b"partial-video")
+            video_path = None
+        else:
+            video_path = None
+        evidence = self.health.evidence
+        terminal_health = CaptureHealth(
+            **{
+                **self.health.__dict__,
+                "phase": CapturePhase.COMPLETED if self.clean else CapturePhase.FAULT,
+                "ready": False,
+                "clean": self.clean,
+                "evidence": evidence,
+            }
+        )
+        self.health = terminal_health
+        self.result = CaptureResult(
+            reason,
+            video_path,
+            partial,
+            self.readable,
+            self.clean,
+            terminal_health,
+            self.error,
+            evidence,
+        )
+        return self.result
+
+
+class StartupFailureCamera(EvidenceCamera):
+    def start_capture(self, output_directory: Path, device_identifier: str, *, duration_seconds=None) -> None:
+        self.started.append((output_directory, device_identifier))
+        partial = output_directory / "video.partial.mkv"
+        partial.write_bytes(b"startup-partial")
+        evidence = CaptureEvidence(
+            startup_proven=False,
+            cooperative_shutdown=False,
+            process_exit_code=1,
+            drainers_stopped=True,
+            verification_readable=False,
+            promoted=False,
+            shutdown_escalated=False,
+        )
+        self.health = CaptureHealth(
+            **{
+                **self.health.__dict__,
+                "phase": CapturePhase.FAULT,
+                "ready": False,
+                "clean": False,
+                "evidence": evidence,
+            }
+        )
+        self.result = CaptureResult(
+            "startup-failure",
+            None,
+            partial,
+            False,
+            False,
+            self.health,
+            "camera unavailable",
+            evidence,
+        )
+        raise RuntimeError("camera unavailable")
 
 
 def _fit() -> CalibrationFit:
@@ -253,6 +405,291 @@ def test_decoded_frames_record_missing_calibration_as_explicit_raw_only_value(tm
     assert "raw-only" in " ".join(controller.snapshot.diagnostic_text)
 
 
+def test_run_manifest_serializes_complete_capture_evidence_without_private_command_data(tmp_path: Path) -> None:
+    camera = EvidenceCamera()
+    controller, _, _ = _controller(tmp_path, camera=camera)
+    controller.configure(_configuration(tmp_path))
+    controller.start()
+    assert camera.started
+    camera.command = (
+        "/opt/private/ffmpeg",
+        "-i",
+        "/home/operator/private-camera-input",
+        "-password",
+        "do-not-persist",
+        "token=also-do-not-persist",
+        str(camera.started[-1][0] / "video.partial.mkv"),
+    )
+
+    result = controller.complete()
+
+    assert result.manifest_path is not None
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))["payload"]
+    capture = payload["capture"]
+    assert capture["status"] == "completed"
+    assert capture["requested_target"] == {
+        "width": 3840,
+        "height": 2160,
+        "fps": 60,
+        "label": "3840x2160@60",
+    }
+    assert capture["selected_device"] == {
+        "identifier": "fake-camera",
+        "backend": "v4l2",
+        "mode": {"width": 3840, "height": 2160, "fps": 60.0, "pixel_format": "nv12"},
+    }
+    assert capture["encoder"] == "h264_nvenc"
+    assert capture["ffmpeg"]["version"] == "ffmpeg version 7.1"
+    assert capture["ffmpeg"]["build"] == "test build"
+    assert capture["ffmpeg"]["command"] == [
+        "ffmpeg",
+        "-i",
+        "<external-path>",
+        "-password",
+        "<redacted>",
+        "token=<redacted>",
+        f"runs/{result.manifest_path.parent.name}/video.partial.mkv",
+    ]
+    assert "do-not-persist" not in json.dumps(capture)
+    assert str(tmp_path) not in json.dumps(capture)
+    assert capture["startup"] == {
+        "proven": True,
+        "proof_at": None,
+        "components": {
+            "negotiated_profile": True,
+            "progress": True,
+            "output_file": True,
+            "preview": True,
+        },
+    }
+    assert capture["negotiated"] == {
+        "width": 3840,
+        "height": 2160,
+        "fps": 60.0,
+        "pixel_format": "nv12",
+        "codec": "rawvideo",
+    }
+    assert capture["progress"] == {
+        "frames": 240,
+        "fps": 59.94,
+        "speed": 1.01,
+        "output_time_us": 4_000_000,
+        "file_size_bytes": 12_345_678,
+        "duplicate_frames": 2,
+        "dropped_frames": 3,
+        "malformed_progress_lines": 1,
+    }
+    assert capture["preview"] == {
+        "received_frames": 40,
+        "consumed_frames": 12,
+        "dropped_frames": 28,
+        "latest_timestamp": None,
+        "rate_fps": None,
+        "profile": None,
+        "maximum_age_seconds": 0.1,
+    }
+    assert capture["termination"] == {
+        "controller_reason": "controller completion",
+        "stop_reason": "controller completion",
+        "failure": None,
+        "clean": True,
+        "cooperative_shutdown": True,
+        "process_exit_code": 0,
+        "drainers_stopped": True,
+        "shutdown_escalated": False,
+    }
+    assert capture["verification"] == {
+        "readable": True,
+        "evidence_readable": True,
+        "duration_seconds": None,
+        "frame_count": None,
+        "streams": None,
+    }
+    assert capture["paths"] == {
+        "partial_path": None,
+        "final_path": f"runs/{result.manifest_path.parent.name}/video.mkv",
+    }
+    assert capture["promotion"] == {"promoted": True, "outcome": "promoted"}
+    assert payload["camera"]["finalized_video"] == capture["paths"]["final_path"]
+    assert payload["output_files"] == [
+        f"runs/{result.manifest_path.parent.name}/pressure.csv",
+        f"runs/{result.manifest_path.parent.name}/video.mkv",
+    ]
+
+
+def test_unclean_capture_retains_partial_evidence_and_faults_requested_stop(tmp_path: Path) -> None:
+    camera = EvidenceCamera(clean=False, readable=True, promoted=False, error="ffprobe rejected recording")
+    controller, _, _ = _controller(tmp_path, camera=camera)
+    controller.configure(_configuration(tmp_path))
+    controller.start()
+
+    result = controller.stop()
+
+    assert result.completion is RunCompletion.FAULTED
+    assert result.manifest_path is not None
+    capture = json.loads(result.manifest_path.read_text(encoding="utf-8"))["payload"]["capture"]
+    assert capture["status"] == "retained_partial"
+    assert capture["termination"]["stop_reason"] == "operator stop"
+    assert capture["termination"]["failure"] == "ffprobe rejected recording"
+    assert capture["paths"]["final_path"] is None
+    assert capture["paths"]["partial_path"] == f"runs/{result.manifest_path.parent.name}/video.partial.mkv"
+    assert capture["promotion"] == {"promoted": False, "outcome": "retained_partial"}
+    assert (result.manifest_path.parent / "video.partial.mkv").is_file()
+
+
+def test_unclean_capture_without_a_partial_file_records_failed_not_retained(tmp_path: Path) -> None:
+    camera = EvidenceCamera(
+        clean=False,
+        readable=False,
+        promoted=False,
+        error="FFmpeg produced no partial recording",
+        retain_partial=False,
+    )
+    controller, _, _ = _controller(tmp_path, camera=camera)
+    controller.configure(_configuration(tmp_path))
+    controller.start()
+
+    result = controller.stop()
+
+    assert result.manifest_path is not None
+    capture = json.loads(result.manifest_path.read_text(encoding="utf-8"))["payload"]["capture"]
+    assert capture["status"] == "failed"
+    assert capture["paths"]["partial_path"] is None
+    assert capture["promotion"] == {"promoted": False, "outcome": "not_promoted"}
+
+
+def test_capture_startup_failure_preserves_result_evidence_before_manifest_finalization(tmp_path: Path) -> None:
+    camera = StartupFailureCamera()
+    controller, _, _ = _controller(tmp_path, camera=camera)
+    controller.configure(_configuration(tmp_path))
+
+    with pytest.raises(RuntimeError, match="camera unavailable"):
+        controller.start()
+
+    result = controller.finalization_result
+    assert result is not None and result.manifest_path is not None
+    capture = json.loads(result.manifest_path.read_text(encoding="utf-8"))["payload"]["capture"]
+    assert capture["status"] == "retained_partial"
+    assert capture["startup"]["proven"] is False
+    assert capture["termination"]["failure"] == "camera unavailable"
+    assert capture["verification"]["readable"] is False
+    assert capture["paths"]["partial_path"] == f"runs/{result.manifest_path.parent.name}/video.partial.mkv"
+    assert capture["promotion"] == {"promoted": False, "outcome": "retained_partial"}
+
+
+def test_disabled_capture_manifest_uses_explicit_unknown_evidence_values(tmp_path: Path) -> None:
+    controller = RunController(
+        serial=FakeSerial(),
+        camera=None,
+        storage=ArtifactFileStore(tmp_path),
+    )
+    controller.configure(_configuration(tmp_path, record_video=False, camera_device=""))
+    controller.start()
+
+    result = controller.global_stop()
+
+    assert result.manifest_path is not None
+    capture = json.loads(result.manifest_path.read_text(encoding="utf-8"))["payload"]["capture"]
+    assert capture["status"] == "disabled"
+    assert capture["selected_device"] == {"identifier": None, "backend": None, "mode": None}
+    assert capture["encoder"] is None
+    assert capture["ffmpeg"] == {"command": None, "version": None, "build": None}
+    assert capture["startup"]["proven"] is None
+    assert capture["negotiated"] is None
+    assert capture["progress"]["frames"] is None
+    assert capture["preview"]["latest_timestamp"] is None
+    assert capture["verification"] == {
+        "readable": None,
+        "evidence_readable": None,
+        "duration_seconds": None,
+        "frame_count": None,
+        "streams": None,
+    }
+    assert capture["paths"] == {"partial_path": None, "final_path": None}
+    assert capture["promotion"] == {"promoted": None, "outcome": "not_started"}
+
+
+def test_camera_unavailable_before_start_writes_a_manifest_with_no_invented_capture_paths(tmp_path: Path) -> None:
+    class UnavailableCamera(FakeCamera):
+        def start_capture(self, output_directory: Path, device_identifier: str, *, duration_seconds=None) -> None:
+            raise RuntimeError("camera unavailable")
+
+        def stop_capture(self, reason: str) -> CaptureResult:
+            raise RuntimeError("camera did not start")
+
+    controller, _, _ = _controller(tmp_path, camera=UnavailableCamera())
+    controller.configure(_configuration(tmp_path))
+
+    with pytest.raises(RuntimeError, match="camera unavailable"):
+        controller.start()
+
+    result = controller.finalization_result
+    assert result is not None and result.manifest_path is not None
+    capture = json.loads(result.manifest_path.read_text(encoding="utf-8"))["payload"]["capture"]
+    assert capture["status"] == "unavailable"
+    assert capture["paths"] == {"partial_path": None, "final_path": None}
+    assert capture["termination"]["failure"] is None
+    assert capture["verification"]["readable"] is None
+
+
+def test_capture_with_missing_optional_contract_fields_persists_null_not_defaults(tmp_path: Path) -> None:
+    controller, _, _ = _controller(tmp_path, camera=FakeCamera())
+    controller.configure(_configuration(tmp_path))
+    controller.start()
+
+    result = controller.complete()
+
+    assert result.manifest_path is not None
+    capture = json.loads(result.manifest_path.read_text(encoding="utf-8"))["payload"]["capture"]
+    assert capture["encoder"] is None
+    assert capture["ffmpeg"] == {"command": None, "version": None, "build": None}
+    assert capture["selected_device"]["backend"] is None
+    assert capture["selected_device"]["mode"] is None
+    assert capture["negotiated"] is None
+    assert capture["verification"]["duration_seconds"] is None
+    assert capture["verification"]["frame_count"] is None
+    assert capture["verification"]["streams"] is None
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_reason"),
+    [("complete", "controller completion"), ("stop", "operator stop")],
+)
+def test_controller_terminal_reason_is_linked_to_capture_stop_evidence(
+    tmp_path: Path,
+    method: str,
+    expected_reason: str,
+) -> None:
+    camera = EvidenceCamera()
+    controller, _, _ = _controller(tmp_path, camera=camera)
+    controller.configure(_configuration(tmp_path))
+    controller.start()
+
+    result = getattr(controller, method)()
+
+    assert result.manifest_path is not None
+    capture = json.loads(result.manifest_path.read_text(encoding="utf-8"))["payload"]["capture"]
+    assert capture["termination"]["controller_reason"] == expected_reason
+    assert capture["termination"]["stop_reason"] == expected_reason
+
+
+def test_repeated_finalize_keeps_one_immutable_capture_manifest(tmp_path: Path) -> None:
+    camera = EvidenceCamera()
+    controller, _, _ = _controller(tmp_path, camera=camera)
+    controller.configure(_configuration(tmp_path))
+    controller.start()
+
+    first = controller.stop()
+    assert first.manifest_path is not None
+    content = first.manifest_path.read_bytes()
+    second = controller.stop()
+
+    assert second.idempotent
+    assert second.manifest_path == first.manifest_path
+    assert second.manifest_path.read_bytes() == content
+    assert camera.stops == 1
+
+
 @pytest.mark.parametrize(
     "method",
     ["stop", "global_stop", "controller_timeout", "controller_fault", "camera_fault", "close"],
@@ -393,6 +830,41 @@ def test_global_stop_winning_during_camera_start_cannot_send_start_or_leak_camer
 
     assert "CMD:START" not in serial.commands
     assert camera.stops == 1
+
+
+def test_stop_during_artifact_reservation_publishes_one_complete_terminal_manifest(tmp_path: Path) -> None:
+    class BlockingStore(ArtifactFileStore):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.entered = Event()
+            self.release = Event()
+
+        def begin_run_artifacts(self, *, run_id: str | None = None, software_version: str | None = None):
+            self.entered.set()
+            assert self.release.wait(1)
+            return super().begin_run_artifacts(run_id=run_id, software_version=software_version)
+
+    store = BlockingStore(tmp_path)
+    camera = EvidenceCamera()
+    controller = RunController(serial=FakeSerial(), camera=camera, storage=store)  # type: ignore[arg-type]
+    controller.configure(_configuration(tmp_path))
+    worker = controller.start_async()
+    assert store.entered.wait(1)
+
+    initial = controller.global_stop()
+    assert initial.manifest_path is None
+    store.release.set()
+    worker.join(1)
+
+    result = controller.finalization_result
+    assert result is not None and result.manifest_path is not None
+    original = result.manifest_path.read_bytes()
+    payload = json.loads(original)["payload"]
+    assert payload["completion"] == "aborted"
+    assert payload["experiment"]["name"] == "cyclic validation"
+    assert payload["capture"]["status"] == "unavailable"
+    assert controller.stop().manifest_path == result.manifest_path
+    assert result.manifest_path.read_bytes() == original
 
 
 def test_global_stop_waits_for_in_flight_start_write_then_sends_stop(tmp_path: Path) -> None:

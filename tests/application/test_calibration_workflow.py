@@ -22,9 +22,28 @@ from soft_actuator_testing.domain.artifacts import ArtifactType
 from soft_actuator_testing.domain.calibration import CalibrationModelType
 from soft_actuator_testing.domain.errors import CalibrationError
 from soft_actuator_testing.infrastructure.artifact_store import ArtifactFileStore
+from soft_actuator_testing.infrastructure.serial_adapter import CommandReceipt, CommandState, TelemetryFrame
 
 
 NOW = datetime(2026, 7, 11, tzinfo=timezone.utc)
+
+
+def _streaming_receipt(command: str) -> CommandReceipt:
+    return CommandReceipt(command, "test", NOW, CommandState.SENT)
+
+
+class _PollingSubscription:
+    """Small test seam standing in for an independently owned frame stream."""
+
+    def __init__(self, poll) -> None:
+        self._poll = poll
+        self.closed = False
+
+    def drain(self):
+        return self._poll()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _service() -> CalibrationWorkflowService:
@@ -115,19 +134,21 @@ def test_versioned_save_load_and_legacy_import_export(tmp_path: Path) -> None:
 
 
 def test_serial_controller_bridge_uses_decoded_voltage_field_not_raw_text() -> None:
-    from soft_actuator_testing.infrastructure.serial_adapter import TelemetryFrame
-
     class Controller:
         def __init__(self) -> None:
             self.streaming: list[bool] = []
             self.polls = 0
 
-        def set_legacy_calibration_streaming(self, enabled: bool) -> None:
+        def set_legacy_calibration_streaming(self, enabled: bool) -> CommandReceipt:
             self.streaming.append(enabled)
+            return _streaming_receipt("CMD:CAL_ON" if enabled else "CMD:CAL_OFF")
+
+        def subscribe_frames(self, *_args, **_kwargs):
+            return _PollingSubscription(self.poll)
 
         def poll(self):
             self.polls += 1
-            if self.polls == 2:
+            if self.polls == 3:
                 return (
                     TelemetryFrame(
                         raw_line="timestamp 123.0, status, 1.25",
@@ -149,8 +170,12 @@ def test_serial_capture_times_out_and_releases_calibration_streaming() -> None:
         def __init__(self) -> None:
             self.streaming: list[bool] = []
 
-        def set_legacy_calibration_streaming(self, enabled: bool) -> None:
+        def set_legacy_calibration_streaming(self, enabled: bool) -> CommandReceipt:
             self.streaming.append(enabled)
+            return _streaming_receipt("CMD:CAL_ON" if enabled else "CMD:CAL_OFF")
+
+        def subscribe_frames(self, *_args, **_kwargs):
+            return _PollingSubscription(self.poll)
 
         def poll(self):
             return ()
@@ -174,8 +199,12 @@ def test_serial_capture_cancellation_releases_calibration_streaming() -> None:
         def __init__(self) -> None:
             self.streaming: list[bool] = []
 
-        def set_legacy_calibration_streaming(self, enabled: bool) -> None:
+        def set_legacy_calibration_streaming(self, enabled: bool) -> CommandReceipt:
             self.streaming.append(enabled)
+            return _streaming_receipt("CMD:CAL_ON" if enabled else "CMD:CAL_OFF")
+
+        def subscribe_frames(self, *_args, **_kwargs):
+            return _PollingSubscription(self.poll)
 
         def poll(self):
             return ()
@@ -194,4 +223,83 @@ def test_serial_capture_cancellation_releases_calibration_streaming() -> None:
     )
     with pytest.raises(CalibrationCaptureCancelled, match="cancelled"):
         source.request_after(source.current_sequence(), cancellation=cancellation)
+    assert controller.streaming == [True, False]
+
+
+def test_serial_capture_rejects_failed_calibration_commands_and_still_attempts_cleanup() -> None:
+    class Controller:
+        def __init__(self) -> None:
+            self.streaming: list[bool] = []
+
+        def set_legacy_calibration_streaming(self, enabled: bool) -> None:
+            self.streaming.append(enabled)
+            return None
+
+        def subscribe_frames(self, *_args, **_kwargs):
+            return _PollingSubscription(self.poll)
+
+        def poll(self):
+            return ()
+
+    controller = Controller()
+    source = SerialCalibrationSampleSource(controller)  # type: ignore[arg-type]
+
+    with pytest.raises(CalibrationError, match="CAL_ON was not sent"):
+        source.request_after(source.current_sequence())
+    assert controller.streaming == [True, False]
+
+
+def test_serial_capture_surfaces_cal_off_failure_after_a_fresh_measurement() -> None:
+    class Controller:
+        def __init__(self) -> None:
+            self.streaming: list[bool] = []
+            self.polls = 0
+
+        def set_legacy_calibration_streaming(self, enabled: bool) -> CommandReceipt | None:
+            self.streaming.append(enabled)
+            return _streaming_receipt("CMD:CAL_ON") if enabled else None
+
+        def subscribe_frames(self, *_args, **_kwargs):
+            return _PollingSubscription(self.poll)
+
+        def poll(self):
+            self.polls += 1
+            return (
+                ()
+                if self.polls == 1
+                else (TelemetryFrame("t,x,v", NOW, {"volts": 1.75}),)
+            )
+
+    controller = Controller()
+    source = SerialCalibrationSampleSource(controller, poll_interval_seconds=0.001)  # type: ignore[arg-type]
+
+    with pytest.raises(CalibrationError, match="CAL_OFF cleanup failed"):
+        source.request_after(source.current_sequence())
+    assert controller.streaming == [True, False]
+
+
+def test_serial_capture_discards_queued_pre_cal_on_telemetry_before_accepting_a_fresh_sample() -> None:
+    class Controller:
+        def __init__(self) -> None:
+            self.streaming: list[bool] = []
+            self.polls = 0
+
+        def set_legacy_calibration_streaming(self, enabled: bool) -> CommandReceipt:
+            self.streaming.append(enabled)
+            return _streaming_receipt("CMD:CAL_ON" if enabled else "CMD:CAL_OFF")
+
+        def subscribe_frames(self, *_args, **_kwargs):
+            return _PollingSubscription(self.poll)
+
+        def poll(self):
+            self.polls += 1
+            volts = 0.25 if self.polls == 1 else 1.75 if self.polls == 2 else None
+            return () if volts is None else (TelemetryFrame("t,x,v", NOW, {"volts": volts}),)
+
+    controller = Controller()
+    source = SerialCalibrationSampleSource(controller, poll_interval_seconds=0.001)  # type: ignore[arg-type]
+
+    measurement = source.request_after(source.current_sequence())
+
+    assert measurement is not None and measurement.volts == 1.75
     assert controller.streaming == [True, False]

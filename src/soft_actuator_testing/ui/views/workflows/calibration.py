@@ -139,6 +139,8 @@ class CalibrationPage(WorkflowPage):
         self.collect_button.setObjectName("collect-samples")
         self.collect_button.clicked.connect(self.collect_samples)
         samples_layout.addWidget(self.collect_button)
+        if self.production_mode:
+            self.collect_button.hide()
 
         fit_group = self.section("Calibration fit")
         fit_layout = QFormLayout(fit_group)
@@ -270,6 +272,8 @@ class CalibrationPage(WorkflowPage):
         self._call(lambda: self.calibration_service.record_sample(self.known_pressure.text()), scenario=PageScenario.READY)
 
     def collect_samples(self) -> None:
+        if self.production_mode:
+            return
         self.dispatch(CollectCalibrationSamples())
         self.calibration_service.replace_samples(self.application_snapshot.calibration.samples)
         self._presenter_samples_imported = True
@@ -304,8 +308,11 @@ class CalibrationPage(WorkflowPage):
 
     def fit_calibration(self) -> None:
         model_type = CalibrationModelType(self.model_type.currentData())
-        self._call(lambda: self.calibration_service.fit(model_type), scenario=PageScenario.COMPLETED)
-        if self.calibration_service.snapshot.fit is not None:
+        self._call(
+            lambda: self.calibration_service.fit(model_type),
+            scenario=None if self.production_mode else PageScenario.COMPLETED,
+        )
+        if not self.production_mode and self.calibration_service.snapshot.fit is not None:
             self.dispatch(FitCalibration())
 
     def save_versioned(self) -> None:

@@ -75,10 +75,17 @@ Pressure data is versioned `runs/<id>/pressure.csv` with
 `schema_version,artifact_id,time_s,volts,pressure_kPa`; an empty
 `pressure_kPa` is the explicit raw-only representation. Analysis results are
 versioned `analysis/<id>/angles.csv` with
-`schema_version,artifact_id,frame_index,video_time_seconds,tip_x,tip_y,actuator_angle_degrees,detection_state,confidence,correction_applied,legacy_import`.
+`schema_version,artifact_id,frame_index,video_time_seconds,tip_x,tip_y,actuator_angle_degrees,detection_state,confidence,correction_applied,detection_reason,legacy_import`.
 The `legacy_import` flag permits legacy angle rows that have an angle but no
 recoverable tip coordinates; new rows still require coordinates for every
 non-missing detection.
+
+The original version-1 analysis header ended at
+`correction_applied,legacy_import`. The additive `detection_reason` column is
+also accepted as version 1 because it is optional provenance, not a changed
+interpretation of existing scientific values. Readers explicitly accept both
+exact headers; writers emit the newer header and never discard data from an
+original-header artifact.
 
 ### Field-by-field compatibility mapping
 
@@ -108,6 +115,23 @@ identities, start/end times, synchronization mode, requested vs. measured
 capture mode, recorder/encoder, frame/drop counters, output files, warnings,
 and a clean/stopped/aborted/faulted completion state (see
 [`0003-concurrency-and-run-finalization.md`](0003-concurrency-and-run-finalization.md)).
+
+#### Additive capture evidence in V1 — 2026-07-13
+
+`payload.capture` is an additive V1 provenance area populated by
+`RunController` from typed `CaptureResult`/`CaptureHealth` facts. It includes
+the requested target, selected device metadata when available, sanitized
+FFmpeg details, startup/negotiation/progress/preview facts, terminal cleanup
+evidence, FFprobe readability, portable partial/final paths, and promotion
+outcome. A field that the typed contract does not provide (for example,
+FFprobe duration/frame count/streams or preview timestamp/rate) is `null`;
+the writer never derives it from a different source.
+
+Old V1 run manifests without `capture` remain valid and load unchanged. This
+does not warrant a schema bump because it changes neither run completion nor
+the scientific interpretation of pressure rows. Readers preserve unknown
+additive payload fields; a future incompatible change still requires an
+explicit schema version and migrator.
 
 **Analysis** — the versioned angle CSV includes at least frame index, video
 time in seconds, tip x/y, actuator angle in degrees, an explicit detection

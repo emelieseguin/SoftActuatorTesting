@@ -41,6 +41,12 @@ class ArtifactIdentity:
     schema_version: int = CURRENT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        if not isinstance(self.artifact_type, ArtifactType):
+            raise DomainError(
+                ErrorCode.ARTIFACT_INVALID,
+                "artifact_type must be a supported artifact type",
+                "artifact_type",
+            )
         if not isinstance(self.artifact_id, str) or not self.artifact_id.strip():
             raise DomainError(
                 ErrorCode.ARTIFACT_INVALID,
@@ -108,13 +114,21 @@ class ArtifactMetadata:
             ("created_at", self.created_at),
             ("updated_at", self.updated_at),
         ):
-            if value.tzinfo is None or value.utcoffset() is None:
+            if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
                 raise DomainError(
                     ErrorCode.ARTIFACT_INVALID,
                     f"{field_name} must be timezone-aware",
                     field_name,
                     "Use a UTC timestamp.",
                 )
+        if self.software_version is not None and (
+            not isinstance(self.software_version, str) or not self.software_version.strip()
+        ):
+            raise DomainError(
+                ErrorCode.ARTIFACT_INVALID,
+                "software_version must be a non-empty string when supplied",
+                "software_version",
+            )
         if self.updated_at < self.created_at:
             raise DomainError(
                 ErrorCode.ARTIFACT_INVALID,

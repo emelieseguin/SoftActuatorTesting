@@ -9,9 +9,11 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 from tempfile import NamedTemporaryFile
 from threading import RLock
 from typing import Any, Mapping, TextIO
+from uuid import uuid4
 
 from soft_actuator_testing.application.services import ArtifactDocument
 from soft_actuator_testing.domain.artifacts import (
@@ -43,12 +45,27 @@ _PATH_KEYS = frozenset(
         "source_video",
         "source_path",
         "video_path",
+        "finalized_video",
         "calibration_snapshot",
         "geometry_snapshot",
         "output_files",
     }
 )
 _ANALYSIS_COLUMNS = (
+    "schema_version",
+    "artifact_id",
+    "frame_index",
+    "video_time_seconds",
+    "tip_x",
+    "tip_y",
+    "actuator_angle_degrees",
+    "detection_state",
+    "confidence",
+    "correction_applied",
+    "detection_reason",
+    "legacy_import",
+)
+_ANALYSIS_COLUMNS_PRIOR_V1 = (
     "schema_version",
     "artifact_id",
     "frame_index",
@@ -77,15 +94,77 @@ class ArtifactFileStore:
     def save(self, document: ArtifactDocument) -> None:
         document = self._validated_document(document)
         target = self._path_for(document.metadata.identity.artifact_type, document.metadata.identity.artifact_id)
-        if document.metadata.identity.artifact_type in _JSON_ARTIFACTS:
-            content = json.dumps(self._json_document(document), indent=2, sort_keys=True, allow_nan=False) + "\n"
-        elif document.metadata.identity.artifact_type is ArtifactType.ANALYSIS_RESULTS:
-            content = self._analysis_csv(document)
-        elif document.metadata.identity.artifact_type is ArtifactType.PRESSURE_DATA:
-            content = self._pressure_csv(document)
-        else:  # pragma: no cover - protected by ArtifactType enum
-            raise self._error("artifact type is not persistable", "artifact_type")
-        self._atomic_create(target, content)
+        self._atomic_create(target, self._content_for(document))
+
+    def import_analysis_source(self, source_video: Path) -> str:
+        """Return a portable analysis-video reference, copying external input once.
+
+        Workspace files remain referenced in place.  Any external video is
+        copied into a UUID-named workspace location before the manifest is
+        built, so an absolute host path is never persisted and duplicate source
+        names cannot overwrite one another.
+        """
+
+        source = self._analysis_source_path(source_video)
+        try:
+            return source.relative_to(self.root).as_posix()
+        except ValueError:
+            pass
+        destination = self.resolve_workspace_path(Path("video") / "analysis-imports" / f"imported-{uuid4().hex}{source.suffix}")
+        self._atomic_copy_new(source, destination)
+        return destination.relative_to(self.root).as_posix()
+
+    def publish_analysis_export(self, results: ArtifactDocument, manifest: ArtifactDocument) -> None:
+        """Publish one analysis results/manifest pair with rollback on member two.
+
+        Both files retain the existing exclusive-create, file-fsync, replace,
+        and directory-fsync behavior.  If the manifest cannot be created before
+        publication, the just-published results file is removed and that
+        removal is directory-fsynced, preventing an orphan results artifact.
+        """
+
+        results = self._validated_document(results)
+        manifest = self._validated_document(manifest)
+        result_identity = results.metadata.identity
+        manifest_identity = manifest.metadata.identity
+        if (
+            result_identity.artifact_type is not ArtifactType.ANALYSIS_RESULTS
+            or manifest_identity.artifact_type is not ArtifactType.ANALYSIS_MANIFEST
+        ):
+            raise self._error("analysis export requires results and manifest documents", "artifact_type")
+        if result_identity.artifact_id != manifest_identity.artifact_id:
+            raise self._error("analysis result and manifest IDs must match", "artifact_id")
+
+        result_target = self._path_for(ArtifactType.ANALYSIS_RESULTS, result_identity.artifact_id)
+        manifest_target = self._path_for(ArtifactType.ANALYSIS_MANIFEST, manifest_identity.artifact_id)
+        self._atomic_create(result_target, self._content_for(results))
+        result_stat = result_target.stat()
+        try:
+            self._atomic_create(manifest_target, self._content_for(manifest))
+        except ArtifactPersistenceError as error:
+            if error.code is ErrorCode.ARTIFACT_PUBLICATION_UNCERTAIN:
+                raise
+            self._remove_reservation(result_target, result_stat)
+            try:
+                self._fsync_directory(result_target.parent)
+            except OSError as rollback_error:
+                raise ArtifactPersistenceError(
+                    ErrorCode.ARTIFACT_PUBLICATION_UNCERTAIN,
+                    f"analysis manifest failed and results rollback durability is uncertain: {rollback_error}",
+                    "artifact",
+                    "Inspect the analysis directory before retrying.",
+                ) from error
+            raise
+
+    def _content_for(self, document: ArtifactDocument) -> str:
+        artifact_type = document.metadata.identity.artifact_type
+        if artifact_type in _JSON_ARTIFACTS:
+            return json.dumps(self._json_document(document), indent=2, sort_keys=True, allow_nan=False) + "\n"
+        if artifact_type is ArtifactType.ANALYSIS_RESULTS:
+            return self._analysis_csv(document)
+        if artifact_type is ArtifactType.PRESSURE_DATA:
+            return self._pressure_csv(document)
+        raise self._error("artifact type is not persistable", "artifact_type")
 
     def preflight_run_storage(self, required_bytes: int = 0) -> None:
         """Fail early when a run workspace cannot accept durable capture output."""
@@ -134,6 +213,7 @@ class ArtifactFileStore:
         directory = self.resolve_workspace_path(Path("runs") / identity.artifact_id)
         try:
             directory.mkdir(parents=True, exist_ok=False)
+            self._fsync_directory(directory.parent)
         except FileExistsError as error:
             raise self._error(
                 "refusing to overwrite an existing run directory",
@@ -157,12 +237,15 @@ class ArtifactFileStore:
         artifact_type: ArtifactType,
         *,
         frame_size: tuple[int, int] | None = None,
+        frame_rate_hz: float | None = None,
     ) -> ArtifactDocument:
         """Read a legacy file without moving, modifying, or overwriting it."""
 
         from .legacy_import import LegacyArtifactImporter
 
-        return LegacyArtifactImporter().import_file(source, artifact_type, frame_size=frame_size)
+        return LegacyArtifactImporter().import_file(
+            source, artifact_type, frame_size=frame_size, frame_rate_hz=frame_rate_hz
+        )
 
     def export_legacy(self, document: ArtifactDocument, destination: Path) -> None:
         """Write the intentionally narrow historical representation atomically."""
@@ -185,15 +268,17 @@ class ArtifactFileStore:
                 return self._from_analysis_csv(path, artifact_id)
             if artifact_type is ArtifactType.PRESSURE_DATA:
                 return self._from_pressure_csv(path, artifact_id)
-        except (OSError, json.JSONDecodeError, csv.Error) as error:
+        except (OSError, UnicodeError, json.JSONDecodeError, csv.Error) as error:
             raise self._error(f"cannot read artifact: {error}", "artifact") from error
         raise self._error("artifact type is not persistable", "artifact_type")
 
     def resolve_workspace_path(self, relative_path: str | Path) -> Path:
         """Resolve a stored reference without permitting workspace escape."""
 
+        if not isinstance(relative_path, (str, Path)):
+            raise self._error("path reference must be a string or path", "path")
         path = Path(relative_path)
-        if path.is_absolute() or ".." in path.parts:
+        if not str(relative_path) or str(relative_path).strip() in {".", "./"} or path.is_absolute() or ".." in path.parts:
             raise self._error(
                 "path must be relative to the workspace and must not traverse parents",
                 "path",
@@ -218,8 +303,35 @@ class ArtifactFileStore:
             return self.resolve_workspace_path(Path("analysis") / safe_id / name)
         raise self._error("artifact type is not persistable", "artifact_type")
 
+    def _analysis_source_path(self, source_video: Path) -> Path:
+        candidate = Path(source_video).expanduser()
+        if not candidate.is_absolute():
+            try:
+                workspace_candidate = self.resolve_workspace_path(candidate)
+            except ArtifactPersistenceError:
+                source = candidate.resolve()
+            else:
+                source = workspace_candidate if workspace_candidate.is_file() else candidate.resolve()
+        else:
+            source = candidate.resolve()
+        if not source.is_file():
+            raise self._error(
+                "analysis source video does not exist or is not a file",
+                "source_video",
+                "Choose a readable finalized video before exporting analysis.",
+            )
+        return source
+
     def _atomic_create(self, target: Path, content: str) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise self._error(
+                f"cannot create artifact directory: {error}",
+                "workspace",
+                "Check workspace permissions and free space, then retry.",
+            ) from error
+        reservation_stat: os.stat_result | None = None
         try:
             reservation = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as error:
@@ -229,7 +341,10 @@ class ArtifactFileStore:
                 "Generate a new artifact ID or explicitly choose a new destination.",
             ) from error
         else:
-            os.close(reservation)
+            try:
+                reservation_stat = os.fstat(reservation)
+            finally:
+                os.close(reservation)
 
         temporary: Path | None = None
         replaced = False
@@ -249,7 +364,15 @@ class ArtifactFileStore:
             os.replace(temporary, target)
             replaced = True
             temporary = None
+            self._fsync_directory(target.parent)
         except OSError as error:
+            if replaced:
+                raise ArtifactPersistenceError(
+                    ErrorCode.ARTIFACT_PUBLICATION_UNCERTAIN,
+                    f"artifact was replaced but final directory fsync failed: {error}",
+                    "artifact",
+                    "The artifact may be published but its durability is uncertain; do not delete or overwrite it.",
+                ) from error
             raise self._error(
                 f"atomic write failed: {error}",
                 "artifact",
@@ -258,14 +381,78 @@ class ArtifactFileStore:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-            # A failed write or replacement leaves only our empty reservation.
             if not replaced:
-                target.unlink(missing_ok=True)
+                self._remove_reservation(target, reservation_stat)
+
+    def _atomic_copy_new(self, source: Path, target: Path) -> None:
+        """Durably copy ``source`` to a never-overwritten workspace ``target``."""
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise self._error(
+                f"cannot create analysis import directory: {error}",
+                "workspace",
+                "Check workspace permissions and free space, then retry.",
+            ) from error
+        try:
+            reservation = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as error:
+            raise self._error(
+                "refusing to overwrite an existing imported analysis video",
+                "source_video",
+                "Retry the import to create a new collision-safe copy.",
+            ) from error
+        try:
+            reservation_stat = os.fstat(reservation)
+        finally:
+            os.close(reservation)
+
+        temporary: Path | None = None
+        replaced = False
+        try:
+            with source.open("rb") as input_handle, NamedTemporaryFile(
+                mode="wb",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as output_handle:
+                temporary = Path(output_handle.name)
+                shutil.copyfileobj(input_handle, output_handle)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+            os.replace(temporary, target)
+            replaced = True
+            temporary = None
+            self._fsync_directory(target.parent)
+        except OSError as error:
+            if replaced:
+                raise ArtifactPersistenceError(
+                    ErrorCode.ARTIFACT_PUBLICATION_UNCERTAIN,
+                    f"analysis source was imported but final directory fsync failed: {error}",
+                    "source_video",
+                    "The imported source may exist but its durability is uncertain; inspect it before retrying.",
+                ) from error
+            raise self._error(
+                f"cannot import analysis source video: {error}",
+                "source_video",
+                "Check source readability and workspace free space, then retry.",
+            ) from error
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            if not replaced:
+                self._remove_reservation(target, reservation_stat)
 
     def _validated_document(self, document: ArtifactDocument) -> ArtifactDocument:
         if not isinstance(document, ArtifactDocument):
             raise self._error("document must be an ArtifactDocument", "document")
         metadata = document.metadata
+        if not isinstance(metadata, ArtifactMetadata):
+            raise self._error("document metadata must be ArtifactMetadata", "metadata")
+        if not isinstance(document.payload, Mapping):
+            raise self._error("document payload must be an object", "payload")
         if metadata.identity.schema_version != CURRENT_SCHEMA_VERSION:
             require_supported_schema_version(metadata.identity.schema_version)
             raise self._error(
@@ -274,6 +461,7 @@ class ArtifactFileStore:
                 "Migrate the document before saving it.",
             )
         payload = self._portable_payload(dict(document.payload), "payload")
+        self._json_safe(payload, "payload")
         self._validate_payload(metadata.identity.artifact_type, payload)
         return ArtifactDocument(metadata, payload)
 
@@ -305,20 +493,22 @@ class ArtifactFileStore:
             root.get("software_version"),
         )
         payload = self._portable_payload(self._mapping(root.get("payload"), "payload"), "payload")
+        self._json_safe(payload, "payload")
         self._validate_payload(artifact_type, payload)
         return ArtifactDocument(metadata, payload)
 
     def _analysis_csv(self, document: ArtifactDocument) -> str:
-        rows = document.payload["rows"]
-        output = [",".join(_ANALYSIS_COLUMNS)]
-        for row in rows:
-            output.append(
-                ",".join(
-                    self._csv_value(self._analysis_cell(document, row, column))
-                    for column in _ANALYSIS_COLUMNS
-                )
+        from io import StringIO
+
+        output = StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(_ANALYSIS_COLUMNS)
+        for row in document.payload["rows"]:
+            writer.writerow(
+                self._csv_value(self._analysis_cell(document, row, column))
+                for column in _ANALYSIS_COLUMNS
             )
-        return "\n".join(output) + "\n"
+        return output.getvalue()
 
     @staticmethod
     def _analysis_cell(document: ArtifactDocument, row: Mapping[str, Any], column: str) -> Any:
@@ -331,25 +521,31 @@ class ArtifactFileStore:
         return row.get(column)
 
     def _pressure_csv(self, document: ArtifactDocument) -> str:
-        output = [",".join(_PRESSURE_COLUMNS)]
+        from io import StringIO
+
+        output = StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(_PRESSURE_COLUMNS)
         for row in document.payload["rows"]:
-            output.append(
-                ",".join(
-                    self._csv_value(row.get(column) if column not in {"schema_version", "artifact_id"} else (
+            writer.writerow(
+                self._csv_value(
+                    row.get(column)
+                    if column not in {"schema_version", "artifact_id"}
+                    else (
                         document.metadata.identity.schema_version if column == "schema_version" else document.metadata.identity.artifact_id
-                    ))
-                    for column in _PRESSURE_COLUMNS
+                    )
                 )
+                for column in _PRESSURE_COLUMNS
             )
-        return "\n".join(output) + "\n"
+        return output.getvalue()
 
     def _from_analysis_csv(self, path: Path, artifact_id: str) -> ArtifactDocument:
-        with path.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
+        rows = self._read_versioned_csv(path, (_ANALYSIS_COLUMNS, _ANALYSIS_COLUMNS_PRIOR_V1))
         if not rows:
             raise self._error("analysis CSV must contain at least one data row", "rows")
         metadata = self._csv_metadata(rows[0], ArtifactType.ANALYSIS_RESULTS, artifact_id)
-        legacy_import = rows[0].get("legacy_import") == "true"
+        legacy_import = self._csv_boolean(rows[0].get("legacy_import"), "rows[0].legacy_import")
+        self._validate_csv_identity(rows, metadata, legacy_import)
         payload = {
             "rows": [self._analysis_row(row, f"rows[{index}]") for index, row in enumerate(rows)],
             **({"legacy_import": True} if legacy_import else {}),
@@ -358,8 +554,7 @@ class ArtifactFileStore:
         return ArtifactDocument(metadata, payload)
 
     def _from_pressure_csv(self, path: Path, artifact_id: str) -> ArtifactDocument:
-        with path.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
+        rows = self._read_versioned_csv(path, (_PRESSURE_COLUMNS,))
         # Aborted/faulted runs may have created and durably flushed only the
         # header before any decoded telemetry arrived.  The companion run
         # manifest is authoritative for its timestamps/completion.
@@ -372,6 +567,7 @@ class ArtifactFileStore:
             )
             return ArtifactDocument(metadata, {"rows": []})
         metadata = self._csv_metadata(rows[0], ArtifactType.PRESSURE_DATA, artifact_id)
+        self._validate_csv_identity(rows, metadata)
         payload = {"rows": [self._pressure_row(row, f"rows[{index}]") for index, row in enumerate(rows)]}
         self._validate_payload(ArtifactType.PRESSURE_DATA, payload)
         return ArtifactDocument(metadata, payload)
@@ -396,20 +592,28 @@ class ArtifactFileStore:
         elif artifact_type is ArtifactType.GEOMETRY:
             self._validate_geometry(payload)
         elif artifact_type is ArtifactType.RUN_MANIFEST:
-            completion = self._string(payload.get("completion"), "payload.completion")
-            if completion not in {member.value for member in RunCompletion}:
-                raise self._error("completion must be clean, stopped, aborted, or faulted", "payload.completion")
+            self._validate_run_manifest(payload)
         elif artifact_type is ArtifactType.ANALYSIS_MANIFEST:
             self._string(payload.get("source_video"), "payload.source_video")
-            self._string(payload.get("geometry_artifact_id"), "payload.geometry_artifact_id")
+            geometry_id = self._string(payload.get("geometry_artifact_id"), "payload.geometry_artifact_id")
+            ArtifactIdentity(ArtifactType.GEOMETRY, geometry_id)
         elif artifact_type is ArtifactType.ANALYSIS_RESULTS:
             rows = self._list(payload.get("rows"), "payload.rows")
+            previous_index = -1
             for index, row in enumerate(rows):
+                parsed = self._mapping(row, f"payload.rows[{index}]")
                 self._validate_analysis_row(
-                    self._mapping(row, f"payload.rows[{index}]"),
+                    parsed,
                     f"payload.rows[{index}]",
                     allow_missing_tip=payload.get("legacy_import") is True,
                 )
+                frame_index = parsed["frame_index"]
+                if frame_index <= previous_index:
+                    raise self._error(
+                        "analysis rows must have strictly increasing frame indexes",
+                        f"payload.rows[{index}].frame_index",
+                    )
+                previous_index = frame_index
         elif artifact_type is ArtifactType.PRESSURE_DATA:
             rows = self._list(payload.get("rows"), "payload.rows")
             for index, row in enumerate(rows):
@@ -436,6 +640,27 @@ class ArtifactFileStore:
             self._number(pair[0], f"payload.samples[{index}][0]")
             self._number(pair[1], f"payload.samples[{index}][1]")
 
+    def _validate_run_manifest(self, payload: Mapping[str, Any]) -> None:
+        completion = self._string(payload.get("completion"), "payload.completion")
+        if completion not in {member.value for member in RunCompletion}:
+            raise self._error("completion must be clean, stopped, aborted, or faulted", "payload.completion")
+        if "output_files" in payload:
+            output_files = self._list(payload["output_files"], "payload.output_files")
+            for index, value in enumerate(output_files):
+                self._string(value, f"payload.output_files[{index}]")
+        if "capture" not in payload:
+            # V1 manifests written before capture evidence was introduced remain
+            # valid.  Capture is an additive provenance area, not a new
+            # measurement interpretation.
+            return
+        capture = self._mapping(payload["capture"], "payload.capture")
+        self._string(capture.get("status"), "payload.capture.status")
+        paths = self._mapping(capture.get("paths"), "payload.capture.paths")
+        for name in ("partial_path", "final_path"):
+            value = paths.get(name)
+            if value is not None:
+                self._string(value, f"payload.capture.paths.{name}")
+
     def _validate_geometry(self, payload: Mapping[str, Any]) -> None:
         size = self._mapping(payload.get("frame_size"), "payload.frame_size")
         width = self._integer(size.get("width"), "payload.frame_size.width")
@@ -454,20 +679,30 @@ class ArtifactFileStore:
             raise self._error("ROI must be non-empty and within frame bounds", "payload.roi")
 
     def _validate_analysis_row(self, row: Mapping[str, Any], path: str, *, allow_missing_tip: bool = False) -> None:
-        self._integer(row.get("frame_index"), f"{path}.frame_index")
+        frame_index = self._integer(row.get("frame_index"), f"{path}.frame_index")
+        if frame_index < 0:
+            raise self._error("frame index cannot be negative", f"{path}.frame_index")
         state = self._string(row.get("detection_state"), f"{path}.detection_state")
-        if state not in {"detected", "manual", "missing", "held"}:
+        if state not in {"detected", "manual", "missing", "ambiguous", "held"}:
             raise self._error("detection_state is invalid", f"{path}.detection_state")
-        self._number(row.get("video_time_seconds"), f"{path}.video_time_seconds")
-        self._number(row.get("confidence"), f"{path}.confidence")
-        if state == "missing":
+        timestamp = self._number(row.get("video_time_seconds"), f"{path}.video_time_seconds")
+        if timestamp < 0:
+            raise self._error("video time cannot be negative", f"{path}.video_time_seconds")
+        confidence = self._number(row.get("confidence"), f"{path}.confidence")
+        if not 0 <= confidence <= 1:
+            raise self._error("confidence must be in the range [0, 1]", f"{path}.confidence")
+        if state in {"missing", "ambiguous"}:
             if any(row.get(key) is not None for key in ("tip_x", "tip_y", "actuator_angle_degrees")):
                 raise self._error("missing detection must not carry a tip or angle", path)
+            if state == "missing" and confidence != 0:
+                raise self._error("missing detection confidence must be zero", f"{path}.confidence")
         else:
             self._number(row.get("actuator_angle_degrees"), f"{path}.actuator_angle_degrees")
             for key in ("tip_x", "tip_y"):
                 if not allow_missing_tip or row.get(key) is not None:
                     self._number(row.get(key), f"{path}.{key}")
+        if "detection_reason" in row:
+            self._string(row["detection_reason"], f"{path}.detection_reason")
 
     def _validate_pressure_row(self, row: Mapping[str, Any], path: str) -> None:
         self._number(row.get("time_s"), f"{path}.time_s")
@@ -477,10 +712,17 @@ class ArtifactFileStore:
 
     def _portable_payload(self, value: Any, path: str, key: str | None = None) -> Any:
         if isinstance(value, Mapping):
-            return {str(child_key): self._portable_payload(child, f"{path}.{child_key}", str(child_key)) for child_key, child in value.items()}
-        if isinstance(value, list):
+            portable: dict[str, Any] = {}
+            for child_key, child in value.items():
+                if not isinstance(child_key, str):
+                    raise self._error("object keys must be strings", path)
+                portable[child_key] = self._portable_payload(child, f"{path}.{child_key}", child_key)
+            return portable
+        if isinstance(value, (list, tuple)):
             return [self._portable_payload(child, f"{path}[{index}]", key) for index, child in enumerate(value)]
         if key in _PATH_KEYS or (key is not None and key.endswith("_path")):
+            if value is None:
+                return None
             if not isinstance(value, str):
                 raise self._error("path reference must be a string", path)
             candidate = Path(value).expanduser()
@@ -494,7 +736,7 @@ class ArtifactFileStore:
         return value
 
     def _analysis_row(self, row: Mapping[str, str], path: str) -> dict[str, Any]:
-        return {
+        parsed = {
             "frame_index": self._csv_integer(row.get("frame_index"), f"{path}.frame_index"),
             "video_time_seconds": self._csv_number(row.get("video_time_seconds"), f"{path}.video_time_seconds"),
             "tip_x": self._csv_optional_number(row.get("tip_x"), f"{path}.tip_x"),
@@ -502,8 +744,11 @@ class ArtifactFileStore:
             "actuator_angle_degrees": self._csv_optional_number(row.get("actuator_angle_degrees"), f"{path}.actuator_angle_degrees"),
             "detection_state": self._string(row.get("detection_state"), f"{path}.detection_state"),
             "confidence": self._csv_number(row.get("confidence"), f"{path}.confidence"),
-            "correction_applied": row.get("correction_applied") == "true",
+            "correction_applied": self._csv_boolean(row.get("correction_applied"), f"{path}.correction_applied"),
         }
+        if row.get("detection_reason"):
+            parsed["detection_reason"] = row["detection_reason"]
+        return parsed
 
     def _pressure_row(self, row: Mapping[str, str], path: str) -> dict[str, Any]:
         return {
@@ -569,6 +814,88 @@ class ArtifactFileStore:
     def _csv_optional_number(self, value: str | None, path: str) -> float | None:
         return None if value in (None, "") else self._csv_number(value, path)
 
+    def _csv_boolean(self, value: str | None, path: str) -> bool:
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        raise self._error("must be the lowercase boolean true or false", path)
+
+    def _read_versioned_csv(
+        self,
+        path: Path,
+        expected_headers: tuple[tuple[str, ...], ...],
+    ) -> list[dict[str, str]]:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle, strict=True)
+            try:
+                header = next(reader)
+            except StopIteration:
+                raise self._error("CSV must contain a header", "header") from None
+            header_tuple = tuple(header)
+            if header_tuple not in expected_headers:
+                expected = " or ".join(",".join(candidate) for candidate in expected_headers)
+                raise self._error(f"expected CSV header {expected}", "header")
+            rows: list[dict[str, str]] = []
+            for line_number, values in enumerate(reader, start=2):
+                if len(values) != len(header_tuple):
+                    raise self._error("CSV row has the wrong number of fields", f"row[{line_number}]")
+                rows.append(dict(zip(header_tuple, values, strict=True)))
+            return rows
+
+    def _validate_csv_identity(
+        self,
+        rows: list[dict[str, str]],
+        metadata: ArtifactMetadata,
+        legacy_import: bool | None = None,
+    ) -> None:
+        for index, row in enumerate(rows):
+            path = f"rows[{index}]"
+            if self._csv_metadata(row, metadata.identity.artifact_type, metadata.identity.artifact_id).identity != metadata.identity:
+                raise self._error("CSV metadata must be consistent across rows", path)
+            if legacy_import is not None and self._csv_boolean(row.get("legacy_import"), f"{path}.legacy_import") is not legacy_import:
+                raise self._error("legacy_import must be consistent across rows", f"{path}.legacy_import")
+
+    def _json_safe(self, value: Any, path: str) -> None:
+        if value is None or isinstance(value, (str, bool, int)):
+            return
+        if isinstance(value, float):
+            if math.isfinite(value):
+                return
+            raise self._error("must be finite", path)
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                self._json_safe(child, f"{path}[{index}]")
+            return
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise self._error("object keys must be strings", path)
+                self._json_safe(child, f"{path}.{key}")
+            return
+        raise self._error("must be JSON-compatible", path)
+
+    @staticmethod
+    def _remove_reservation(target: Path, reservation_stat: os.stat_result | None) -> None:
+        if reservation_stat is None:
+            return
+        try:
+            current = target.stat()
+            if current.st_ino == reservation_stat.st_ino and current.st_dev == reservation_stat.st_dev:
+                target.unlink()
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        if os.name == "nt":
+            return
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def _timestamp(self, value: Any, path: str) -> datetime:
         if not isinstance(value, str):
             raise self._error("must be an ISO-8601 timestamp", path)
@@ -600,10 +927,18 @@ class DurableRunArtifacts:
     def __post_init__(self) -> None:
         self._io_lock = RLock()
         self._pressure_path = self.directory / "pressure.csv"
-        self._handle: TextIO = self._pressure_path.open("x", newline="", encoding="utf-8")
-        self._writer = csv.DictWriter(self._handle, fieldnames=_PRESSURE_COLUMNS)
-        self._writer.writeheader()
-        self._flush()
+        try:
+            self._handle: TextIO = self._pressure_path.open("x", newline="", encoding="utf-8")
+            self._writer = csv.DictWriter(self._handle, fieldnames=_PRESSURE_COLUMNS)
+            self._writer.writeheader()
+            self._flush()
+            self.store._fsync_directory(self.directory)
+        except Exception:
+            handle = getattr(self, "_handle", None)
+            if handle is not None:
+                handle.close()
+            self._pressure_path.unlink(missing_ok=True)
+            raise
         self._closed = False
         self._manifest_saved = False
 

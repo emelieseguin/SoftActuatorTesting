@@ -184,6 +184,78 @@ persistence hardening, the platform/DPI matrix, and representative operator
 study remain separate production-readiness work; this gate does not claim
 those later obligations are complete.
 
+### Shell/workspace/accessibility remediation outcome — 2026-07-14
+
+A final acceptance pass (`shell-workspace-remediation`) reviewed items 5 and
+6, plus the CLI production/prototype precedence and the production Console's
+demo-wording boundary, against the actual code (not just prior claims) and
+made the following confirmed fixes, all scoped to
+`bootstrap.py`/`ui/app.py`/`ui/shells/instrument_console.py`/
+`ui/views/home_workspace.py`/`ui/widgets/file_picker.py`:
+
+- **CLI precedence (new finding):** `bootstrap.py`'s CLI previously had no
+  `--mode`/`--prototype` conflict check at all, and `ui/app.py`'s
+  `create_application_window` silently discarded `production=True` whenever
+  a `prototype_shell` was also set — the opposite of what
+  `docs/operator-guide.md` already (incorrectly, at the time) claimed was
+  rejected. Fixed: an explicit `--mode production` combined with
+  `--prototype` now exits with `SystemExit(2)` and an actionable message
+  (`bootstrap.py`), and `create_application_window` independently raises
+  `ValueError` for the same combination regardless of entry point
+  (`ui/app.py`). Covered by
+  `tests/test_package.py::test_explicit_mode_production_with_prototype_is_rejected_with_exit_code_2`
+  (and its end-to-end subprocess counterpart) and
+  `tests/ui/test_app_bootstrap.py::test_production_true_with_a_prototype_shell_is_rejected_unambiguously`.
+- **Demo wording in the production Console (new finding):** five
+  unconditional (mode-independent) "demo" wording/behavior leaks were found
+  by a full-file audit of `instrument_console.py` — the Global Stop
+  button/action's accessible text, the telemetry plot title, the Run
+  Control dock's note text, and the Save/Restore layout menu actions all
+  said "demo" even in production mode. All five are now mode-aware. Covered
+  by `tests/ui/test_instrument_console.py::test_production_console_never_shows_demo_wording`
+  and `test_production_console_has_no_demo_menu`.
+- **Item 5 (versioned/validated/transactional/recoverable layout
+  persistence):** previously, layout save/restore in production mode was the
+  same in-memory-only affordance as demo mode (lost on process exit), which
+  does not satisfy "recoverable to an on-screen safe default" across
+  restarts. Fixed: production mode now persists to a versioned, atomically
+  written JSON file (`PersistedLayoutStore`, `_LAYOUT_SCHEMA_VERSION = 1`) at
+  an OS-standard per-user config path; missing/corrupt/schema-mismatched
+  files are handled as a safe no-op (current on-screen layout is kept, no
+  exception). Restore never contacts a device or moves/hides Global Stop.
+  Demo mode is unchanged (still in-memory only, never touches disk). Covered
+  by the `test_production_save_and_restore_layout_round_trips_through_disk`,
+  `test_production_layout_persists_across_separate_window_instances`,
+  `test_production_restore_layout_is_a_safe_no_op_with_no_saved_file`,
+  `test_production_restore_layout_safely_ignores_a_corrupt_file`, and
+  `test_production_restore_layout_never_touches_hardware` tests in
+  `tests/ui/test_instrument_console.py`.
+- **Item 6 (platform/DPI/keyboard/screen-reader evidence):** automated,
+  CI-enforced coverage was strengthened with keyboard Tab/Shift+Tab focus
+  traversal tests, Save/Restore/Global-Stop shortcut *activation* tests (the
+  prior suite only asserted shortcuts were *registered*, not that they
+  actually triggered the right action), and subprocess-based rendered-pixmap
+  scaling tests at representative 100/150/200% (`QT_SCALE_FACTOR`). What
+  `offscreen` Qt cannot prove — real screen-reader announcements, real OS
+  DPI scaling, and a representative operator study — remains **explicitly
+  pending**, tracked cell-by-cell (not claimed complete) in the new
+  [`manual-accessibility-dpi-evidence-matrix.md`](manual-accessibility-dpi-evidence-matrix.md).
+- **Multi-file picker (requirement 3, not an ADR item but part of the same
+  acceptance pass):** the Workspace page's "Open individual files" button
+  only supported single-file selection via `get_open_file`, unlike drag/drop
+  (which already supported multiple files via `OpenIndividualFiles`). Added
+  a plural `get_open_files` method to the `FilePicker` protocol/`QtFilePicker`
+  (backed by `QFileDialog.getOpenFileNames`)/`FakeFilePicker` (a separate
+  `queued_multi_results` queue, so no test ever opens a native dialog), and
+  wired the button to it; the existing single-file API is unchanged and
+  still used by other owners' pages (`video_geometry.py`,
+  `calibration.py`, `analysis.py`).
+
+Items 5 and 6's remaining representative-operator-study and real-hardware
+DPI/screen-reader obligations are **not** satisfied by this pass and must not
+be described as complete; see the evidence matrix document for their current
+status.
+
 ### Selection implementation test plan
 
 - Assert that the normal GUI factory creates Instrument Console.

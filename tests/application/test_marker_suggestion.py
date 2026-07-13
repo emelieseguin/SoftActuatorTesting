@@ -9,6 +9,8 @@ in ``tests/infrastructure/test_red_marker_detector.py`` and the end-to-end
 
 from __future__ import annotations
 
+from threading import Event, Thread
+
 import pytest
 
 from soft_actuator_testing.application.marker_suggestion import (
@@ -344,3 +346,37 @@ def test_marker_suggestion_cancellation_actually_aborts_a_real_workflow_scan() -
     token.cancel()
     with pytest.raises(MarkerSuggestionCancelled):
         engine.suggest("frame", frame_index=0, frame_size=FRAME_SIZE, cancellation=token)
+
+
+def test_concurrent_suggestions_assign_monotonic_sequences_and_make_the_late_result_stale() -> None:
+    first, second = object(), object()
+
+    class BlockingDetector(FakeRedMarkerFrameDetector):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def scan(self, frame, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if frame is first:
+                self.entered.set()
+                assert self.release.wait(1)
+            return super().scan(frame, *args, **kwargs)
+
+    detector = BlockingDetector()
+    scan = RedMarkerScan(FRAME_SIZE, None, (_blob(100, 64),), "mask")
+    detector.register(first, scan)
+    detector.register(second, scan)
+    workflow = MarkerSuggestionWorkflow(detector)
+    results = []
+    thread = Thread(target=lambda: results.append(workflow.suggest(first, frame_index=0, frame_size=FRAME_SIZE)))
+    thread.start()
+    assert detector.entered.wait(1)
+
+    current = workflow.suggest(second, frame_index=1, frame_size=FRAME_SIZE)
+    detector.release.set()
+    thread.join(1)
+
+    assert not thread.is_alive()
+    assert current.sequence == 2 and workflow.is_current(current)
+    assert results[0].sequence == 1 and not workflow.is_current(results[0])

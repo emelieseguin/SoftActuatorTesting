@@ -21,6 +21,7 @@ from soft_actuator_testing.application.camera_capture import (
     CameraPanelPresenter,
     CameraPanelSnapshot,
     CapturePhase,
+    StandaloneCaptureReservation,
 )
 from soft_actuator_testing.ui.presenters.camera import CameraPresenterBridge
 from soft_actuator_testing.ui.themes import DARK_THEME, SemanticState, Theme
@@ -30,7 +31,9 @@ from .controls import AccessibleButton
 from .status import StatusIndicator
 from .video_canvas import VideoCanvas
 
-OutputDirectoryProvider = Callable[[], Path]
+CaptureOutput = Path | StandaloneCaptureReservation
+OutputDirectoryProvider = Callable[[], CaptureOutput | None]
+OutputAvailableProvider = Callable[[], bool]
 
 
 class CameraPanel(QWidget):
@@ -41,12 +44,15 @@ class CameraPanel(QWidget):
         presenter: CameraPanelPresenter,
         *,
         output_directory_provider: OutputDirectoryProvider | None = None,
+        output_available_provider: OutputAvailableProvider | None = None,
         poll_interval_ms: int = 100,
+        auto_refresh: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.presenter = presenter
         self._output_directory_provider = output_directory_provider
+        self._output_available_provider = output_available_provider
         self.setAccessibleName("Camera control and preview")
 
         layout = QVBoxLayout(self)
@@ -88,8 +94,16 @@ class CameraPanel(QWidget):
         self._poll_timer.setInterval(poll_interval_ms)
         self._poll_timer.timeout.connect(self.presenter.refresh_status)
         self._poll_timer.start()
+        # ``CameraPanel`` is often embedded as a child widget (for example in
+        # ``ProductionConnectionsPage``) rather than shown top-level, so it
+        # never receives its own ``closeEvent`` when an owning window closes.
+        # Stopping the timer on ``destroyed`` guarantees it cannot keep
+        # polling a torn-down presenter for as long as the widget object
+        # survives, regardless of how it is parented.
+        self.destroyed.connect(self._poll_timer.stop)
         self.apply_theme(DARK_THEME)
-        self.presenter.refresh_devices()
+        if auto_refresh:
+            self.presenter.refresh_devices()
 
     def render_snapshot(self, snapshot: CameraPanelSnapshot) -> None:
         selected = snapshot.selected_device
@@ -102,7 +116,12 @@ class CameraPanel(QWidget):
                 self.device_selector.setCurrentIndex(selected_index)
 
         self.start_button.setEnabled(
-            snapshot.can_start and self._output_directory_provider is not None
+            snapshot.can_start
+            and self._output_directory_provider is not None
+            and (
+                self._output_available_provider is None
+                or self._output_available_provider()
+            )
         )
         self.stop_button.setEnabled(snapshot.can_stop)
         phase_state = {
@@ -149,6 +168,20 @@ class CameraPanel(QWidget):
         self._bridge.dispose()
         super().closeEvent(event)
 
+    def stop_polling(self) -> None:
+        """Stop the background status-poll timer without closing the presenter.
+
+        Use this from a composition/shell-level shutdown path when this panel
+        is embedded as a child widget of another page: an embedded widget
+        never receives its own ``closeEvent`` when an owning top-level window
+        closes, so an owning composition that already closes the presenter
+        directly (with its own timeout/ordering) can call this to guarantee
+        the timer stops deterministically, without double-closing the
+        presenter.
+        """
+
+        self._poll_timer.stop()
+
     def _device_selected(self, index: int) -> None:
         identifier = self.device_selector.itemData(index)
         if identifier:
@@ -158,10 +191,19 @@ class CameraPanel(QWidget):
         if self._output_directory_provider is None:
             return
         duration = self.duration.value()
+        output_directory = self._output_directory_provider()
+        if output_directory is None:
+            self.health_text.setText("Choose a workspace before starting camera capture.")
+            return
         self.presenter.start_capture(
-            self._output_directory_provider(),
+            output_directory,
             duration_seconds=float(duration) if duration else None,
         )
 
 
-__all__ = ["CameraPanel", "OutputDirectoryProvider"]
+__all__ = [
+    "CameraPanel",
+    "CaptureOutput",
+    "OutputAvailableProvider",
+    "OutputDirectoryProvider",
+]

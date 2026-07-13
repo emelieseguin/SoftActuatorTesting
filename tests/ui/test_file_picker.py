@@ -29,6 +29,32 @@ def test_missing_queued_result_defaults_to_cancelled() -> None:
     assert picker.get_open_file(caption="Open") is None
 
 
+def test_fake_file_picker_returns_queued_multi_results_in_order() -> None:
+    picker = FakeFilePicker(
+        queued_multi_results=[(Path("/demo/a.json"), Path("/demo/b.json")), ()]
+    )
+    assert picker.get_open_files(caption="Open individual artifact files") == (
+        Path("/demo/a.json"),
+        Path("/demo/b.json"),
+    )
+    assert picker.get_open_files(caption="Open individual artifact files") == ()
+
+
+def test_missing_queued_multi_result_defaults_to_cancelled() -> None:
+    picker = FakeFilePicker()
+    assert picker.get_open_files(caption="Open individual artifact files") == ()
+
+
+def test_fake_file_picker_records_multi_select_calls_separately_from_single_select() -> None:
+    picker = FakeFilePicker(queued_multi_results=[(Path("/demo/a.json"),)])
+    filters = (FileFilter("Versioned artifact", ("*.json",)),)
+    picker.get_open_files(caption="Open individual artifact files", filters=filters)
+    assert [call.method for call in picker.calls] == ["get_open_files"]
+    assert picker.calls[0].filters == filters
+    # The single-file queue is independent and unaffected by multi-select calls.
+    assert picker.queued_results == []
+
+
 def test_file_filter_renders_qt_style_filter_string() -> None:
     filt = FileFilter("Video files", ("*.mp4", "*.mkv"))
     assert filt.to_qt_filter() == "Video files (*.mp4 *.mkv)"

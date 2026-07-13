@@ -174,6 +174,62 @@ class UnknownFrame(SerialFrame):
 ParsedFrame = RunMarkerFrame | TelemetryFrame | ErrorFrame | AcknowledgementFrame | DiagnosticFrame | UnknownFrame
 
 
+@dataclass(frozen=True)
+class SerialSubscriptionSnapshot:
+    """Immutable accounting for one independently consumed frame stream."""
+
+    name: str
+    critical: bool
+    capacity: int | None
+    queued_frames: int
+    dropped_frames: int
+    closed: bool
+
+
+@dataclass
+class _FrameSubscriber:
+    name: str
+    capacity: int | None
+    critical: bool
+    frames: deque[ParsedFrame] = field(default_factory=deque)
+    dropped_frames: int = 0
+    closed: bool = False
+
+
+class SerialFrameSubscription:
+    """A named, independently drained view of frames from one adapter.
+
+    The adapter owns dispatch and keeps the queue thread-safe. Consumers own
+    the subscription lifetime and must close it when their workflow ends.
+    """
+
+    def __init__(self, adapter: "SerialAdapter", subscriber: _FrameSubscriber) -> None:
+        self._adapter = adapter
+        self._subscriber = subscriber
+
+    @property
+    def snapshot(self) -> SerialSubscriptionSnapshot:
+        return self._adapter._subscription_snapshot(self._subscriber)
+
+    @property
+    def name(self) -> str:
+        return self._subscriber.name
+
+    @property
+    def dropped_frames(self) -> int:
+        return self.snapshot.dropped_frames
+
+    @property
+    def closed(self) -> bool:
+        return self.snapshot.closed
+
+    def drain(self, maximum: int | None = None) -> tuple[ParsedFrame, ...]:
+        return self._adapter._drain_subscription(self._subscriber, maximum)
+
+    def close(self) -> None:
+        self._adapter._close_subscription(self._subscriber)
+
+
 class SerialTextParser:
     """Parse one decoded serial line without inventing a firmware schema."""
 
@@ -280,6 +336,7 @@ class _PendingCommand:
     command_id: str
     sent_at: datetime
     acknowledgement: AcknowledgementFrame | None = None
+    cancelled: bool = False
 
 
 class SerialAdapter:
@@ -300,10 +357,10 @@ class SerialAdapter:
         self._transport: SerialTransport | None = None
         self._reader: Thread | None = None
         self._stop_reader = Event()
-        self._frames: deque[ParsedFrame] = deque()
         self._queue_capacity = 1
         self._shutdown_timeout_seconds = 1.0
-        self._dropped_frames = 0
+        self._subscribers: dict[str, _FrameSubscriber] = {}
+        self._legacy_subscriber: _FrameSubscriber | None = None
         self._pending: dict[str, _PendingCommand] = {}
         self._timed_out_commands: deque[tuple[str, str]] = deque(maxlen=32)
         self._command_sequence = 0
@@ -315,8 +372,10 @@ class SerialAdapter:
 
     @property
     def dropped_frames(self) -> int:
+        """Drop accounting for deprecated :meth:`drain_frames` callers."""
+
         with self._lock:
-            return self._dropped_frames
+            return self._legacy_subscriber.dropped_frames if self._legacy_subscriber is not None else 0
 
     @property
     def profile(self) -> ParserProfile:
@@ -329,14 +388,21 @@ class SerialAdapter:
         with self._lock:
             if self.is_connected:
                 return False
+            if self._reader is not None and self._reader.is_alive():
+                raise RuntimeError("the previous serial reader has not stopped; reconnect is unsafe")
             transport = self._factory.open(config)
             self._transport = transport
             self._queue_capacity = config.queue_capacity
             self._shutdown_timeout_seconds = config.shutdown_timeout_seconds
-            self._frames.clear()
-            self._dropped_frames = 0
+            self._subscribers.clear()
+            self._legacy_subscriber = _FrameSubscriber(
+                name="__legacy_drain__",
+                capacity=config.queue_capacity,
+                critical=False,
+            )
+            self._subscribers[self._legacy_subscriber.name] = self._legacy_subscriber
             self._stop_reader.clear()
-            self._reader = Thread(target=self._read_loop, name="serial-reader", daemon=False)
+            self._reader = Thread(target=self._read_loop, args=(transport,), name="serial-reader", daemon=False)
             self._reader.start()
             return True
 
@@ -347,9 +413,22 @@ class SerialAdapter:
             if transport is None:
                 return False
             self._stop_reader.set()
+            for pending in self._pending.values():
+                pending.cancelled = True
+            self._acknowledgement.notify_all()
+            self._retire_all_subscribers_locked(
+                ErrorFrame(
+                    raw_line="",
+                    received_at=self._clock(),
+                    message="Serial transport disconnected.",
+                    source="disconnect",
+                )
+            )
+        close_error: Exception | None = None
         try:
             transport.close()
         except Exception as error:
+            close_error = error
             self._offer(
                 ErrorFrame(
                     raw_line="",
@@ -361,28 +440,100 @@ class SerialAdapter:
         if reader is not None:
             reader.join(timeout_seconds if timeout_seconds is not None else self._shutdown_timeout_seconds)
             if reader.is_alive():
+                error = RuntimeError("Serial reader did not stop before the shutdown timeout.")
                 self._offer(
-                    ErrorFrame(
-                        raw_line="",
-                        received_at=self._clock(),
-                        message="Serial reader did not stop before the shutdown timeout.",
-                        source="shutdown",
-                    )
+                    ErrorFrame(raw_line="", received_at=self._clock(), message=str(error), source="shutdown")
                 )
+                raise error
         with self._lock:
-            self._transport = None
-            self._reader = None
+            if self._transport is transport:
+                self._transport = None
+            if self._reader is reader:
+                self._reader = None
             self._pending.clear()
             self._acknowledgement.notify_all()
+        if close_error is not None:
+            raise RuntimeError(f"Serial close failed: {close_error}") from close_error
         return True
 
     def close(self) -> None:
         self.disconnect()
 
     def drain_frames(self, maximum: int | None = None) -> tuple[ParsedFrame, ...]:
+        """Drain the deprecated compatibility stream.
+
+        New application consumers must use :meth:`subscribe_frames`; this
+        method deliberately has no role in production workflow consumption.
+        """
+
         with self._lock:
-            count = len(self._frames) if maximum is None else min(maximum, len(self._frames))
-            return tuple(self._frames.popleft() for _ in range(count))
+            subscriber = self._legacy_subscriber
+        return () if subscriber is None else self._drain_subscription(subscriber, maximum)
+
+    def subscribe_frames(
+        self,
+        name: str,
+        *,
+        critical: bool = False,
+        capacity: int | None = None,
+    ) -> SerialFrameSubscription:
+        """Create one named frame stream without competing with other consumers.
+
+        Critical streams are intentionally unbounded and used for active run
+        persistence and calibration freshness. Noncritical streams are bounded
+        drop-oldest queues with per-subscription accounting.
+        """
+
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("subscription name must not be empty.")
+        if critical and capacity is not None:
+            raise ValueError("critical subscriptions are lossless and cannot set a bounded capacity.")
+        if not critical:
+            capacity = self._queue_capacity if capacity is None else capacity
+            if capacity <= 0:
+                raise ValueError("subscription capacity must be positive.")
+        with self._lock:
+            if self._transport is None or not self._transport.is_open:
+                raise RuntimeError("Serial transport is not connected.")
+            if normalized in self._subscribers:
+                raise ValueError(f"serial subscription {normalized!r} already exists.")
+            subscriber = _FrameSubscriber(normalized, capacity, critical)
+            self._subscribers[normalized] = subscriber
+            return SerialFrameSubscription(self, subscriber)
+
+    def _subscription_snapshot(self, subscriber: _FrameSubscriber) -> SerialSubscriptionSnapshot:
+        with self._lock:
+            return SerialSubscriptionSnapshot(
+                subscriber.name,
+                subscriber.critical,
+                subscriber.capacity,
+                len(subscriber.frames),
+                subscriber.dropped_frames,
+                subscriber.closed,
+            )
+
+    def _drain_subscription(
+        self,
+        subscriber: _FrameSubscriber,
+        maximum: int | None,
+    ) -> tuple[ParsedFrame, ...]:
+        if maximum is not None and maximum < 0:
+            raise ValueError("maximum must be non-negative.")
+        with self._lock:
+            count = len(subscriber.frames) if maximum is None else min(maximum, len(subscriber.frames))
+            return tuple(subscriber.frames.popleft() for _ in range(count))
+
+    def _close_subscription(self, subscriber: _FrameSubscriber) -> None:
+        with self._lock:
+            if subscriber.closed:
+                subscriber.frames.clear()
+                return
+            self._subscribers.pop(subscriber.name, None)
+            subscriber.frames.clear()
+            subscriber.closed = True
+            if subscriber is self._legacy_subscriber:
+                self._legacy_subscriber = None
 
     def send_command(
         self,
@@ -426,6 +577,15 @@ class SerialAdapter:
                 return CommandReceipt(normalized, command_id, sent_at, CommandState.SENT)
             deadline = monotonic() + acknowledgement_timeout_seconds
             while pending.acknowledgement is None:
+                if pending.cancelled:
+                    self._pending.pop(command_id, None)
+                    return CommandReceipt(
+                        normalized,
+                        command_id,
+                        sent_at,
+                        CommandState.WRITE_FAILED,
+                        detail="Serial transport disconnected while waiting for acknowledgement.",
+                    )
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     self._pending.pop(command_id, None)
@@ -448,12 +608,8 @@ class SerialAdapter:
                 acknowledged_at=acknowledgement.received_at,
             )
 
-    def _read_loop(self) -> None:
+    def _read_loop(self, transport: SerialTransport) -> None:
         while not self._stop_reader.is_set():
-            with self._lock:
-                transport = self._transport
-            if transport is None:
-                return
             try:
                 raw = transport.readline()
             except Exception as error:
@@ -466,6 +622,9 @@ class SerialAdapter:
                 continue
             text = raw.decode("utf-8", errors="replace").strip()
             frame = self._parser.parse(text, self._clock())
+            with self._lock:
+                if self._transport is not transport:
+                    return
             self._handle_frame(frame)
 
     def _handle_frame(self, frame: ParsedFrame) -> None:
@@ -513,7 +672,23 @@ class SerialAdapter:
             self._offer_locked(frame)
 
     def _offer_locked(self, frame: ParsedFrame) -> None:
-        if len(self._frames) >= self._queue_capacity:
-            self._frames.popleft()
-            self._dropped_frames += 1
-        self._frames.append(frame)
+        for subscriber in tuple(self._subscribers.values()):
+            self._offer_to_subscriber_locked(subscriber, frame)
+
+    @staticmethod
+    def _offer_to_subscriber_locked(subscriber: _FrameSubscriber, frame: ParsedFrame) -> None:
+        if subscriber.closed:
+            return
+        if subscriber.capacity is not None and len(subscriber.frames) >= subscriber.capacity:
+            subscriber.frames.popleft()
+            subscriber.dropped_frames += 1
+        subscriber.frames.append(frame)
+
+    def _retire_all_subscribers_locked(self, terminal_frame: ErrorFrame) -> None:
+        """Deliver a visible terminal event, then detach every active stream."""
+
+        for subscriber in tuple(self._subscribers.values()):
+            self._offer_to_subscriber_locked(subscriber, terminal_frame)
+            subscriber.closed = True
+        self._subscribers.clear()
+        self._legacy_subscriber = None

@@ -100,15 +100,10 @@ def test_read_frame_after_close_fails_closed() -> None:
     handle.close()
 
 
-def test_open_with_an_already_cancelled_token_still_opens_when_metadata_is_reliable() -> None:
-    # The synthetic fixture reports a reliable frame count, so the cancellable
-    # manual-scan fallback never runs and cancellation has no effect here.
+def test_open_with_an_already_cancelled_token_never_opens_a_video_handle() -> None:
     reader = OpenCvVideoFileReader()
-    handle = reader.open(FIXTURE, cancellation=_AlwaysCancelled())
-    try:
-        assert handle.metadata.frame_count == 3
-    finally:
-        handle.close()
+    with pytest.raises(VideoProbeCancelled):
+        reader.open(FIXTURE, cancellation=_AlwaysCancelled())
 
 
 def test_manual_frame_count_scan_is_cancellable() -> None:

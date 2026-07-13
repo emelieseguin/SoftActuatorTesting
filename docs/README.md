@@ -1,19 +1,37 @@
 # Documentation index
 
-Per `AGENTS.md`, all design notes, architecture decisions, and procedures
-live under `/docs`. Start with:
+All operational procedures, architecture records, and compatibility evidence
+live under `docs/`.
 
-- [`continuation-plan.md`](continuation-plan.md) — the current implementation
-  status, remaining work graph, invariants, stopped sub-agent ledger,
-  verification commands, and exact restart prompt.
-- [`architecture/`](architecture/README.md) — accepted architecture decisions
-  and implementation/test records for the unified rewrite, including capture,
-  serial, calibration, geometry, marker suggestions, and run lifecycle.
-- [`initial-implementation/`](initial-implementation/README.md) — the
-  legacy workflow inventory: a fact-checked analysis of the current scripts
-  and notebook under [`../old-files/`](../old-files/), kept as the
-  historical starting point and legacy-import reference for the rewrite.
+## Use and support
 
-Use [`architecture/README.md`](architecture/README.md) for fixed design
-decisions and [`initial-implementation/README.md`](initial-implementation/README.md)
-for the original behavior that compatibility work must preserve.
+- [Operator guide](operator-guide.md) — installation, safe startup, the complete
+  production Instrument Console workflow, data handling, accessibility, and
+  safety limits.
+- [Troubleshooting](troubleshooting.md) — symptom-based recovery, diagnostics to
+  collect, and conditions that require stopping a run.
+- [Hardware 4K60 acceptance](hardware-4k60-acceptance.md) — the
+  owner-threshold and native-rig evidence procedure; it is not a certification.
+
+## Maintenance and release
+
+- [Maintainer guide](maintainer-guide.md) — layering, lifecycle ownership,
+  protocol uncertainty, analysis authority, and approved extension boundaries.
+- [Artifact schemas and compatibility](artifact-schemas.md) — V1 JSON/CSV
+  contracts, paths, atomicity, and legacy import/export rules.
+- [Test and release guide](test-and-release.md) — default and opt-in test
+  selection, safe CLI checks, native packaging, notices, and release checklist.
+- [Continuation plan](continuation-plan.md) — final software handoff, invariants,
+  verification commands, and the remaining external hardware decisions.
+
+## Design and history
+
+- [Architecture records](architecture/README.md) — accepted decisions and
+  implementation/hardening/packaging records for the unified application.
+- [Legacy implementation inventory](initial-implementation/README.md) —
+  fact-checked historical scripts and notebook behavior retained solely for
+  compatibility context.
+
+For packaging redistribution and runtime-license obligations, start with
+[desktop packaging](architecture/desktop-packaging.md) and
+[dependency licenses](architecture/dependency-licenses.md).

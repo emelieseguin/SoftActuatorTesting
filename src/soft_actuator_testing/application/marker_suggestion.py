@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from math import hypot, isfinite, pi
-from threading import Event
+from threading import Event, Lock
 from typing import Any, Protocol, runtime_checkable
 
 from soft_actuator_testing.application.services import CancellationToken
@@ -334,24 +334,29 @@ class MarkerSuggestionWorkflow:
         self._thresholds = thresholds or HsvRedThresholds()
         self._last_confirmed_tip: PixelPoint | None = None
         self._sequence = 0
+        self._state_lock = Lock()
 
     @property
     def thresholds(self) -> HsvRedThresholds:
-        return self._thresholds
+        with self._state_lock:
+            return self._thresholds
 
     def set_thresholds(self, thresholds: HsvRedThresholds) -> None:
-        self._thresholds = thresholds
+        with self._state_lock:
+            self._thresholds = thresholds
 
     @property
     def sequence(self) -> int:
         """The most recently issued request sequence number."""
 
-        return self._sequence
+        with self._state_lock:
+            return self._sequence
 
     def note_confirmed_tip(self, point: PixelPoint | None) -> None:
         """Record (or clear) the operator-confirmed tip used for temporal continuity."""
 
-        self._last_confirmed_tip = point
+        with self._state_lock:
+            self._last_confirmed_tip = point
 
     def is_current(self, result: MarkerSuggestionResult) -> bool:
         """``False`` once a newer :meth:`suggest` call has been issued.
@@ -360,7 +365,8 @@ class MarkerSuggestionWorkflow:
         so a stale scan is never surfaced as the current tip.
         """
 
-        return result.sequence == self._sequence
+        with self._state_lock:
+            return result.sequence == self._sequence
 
     def suggest(
         self,
@@ -375,10 +381,11 @@ class MarkerSuggestionWorkflow:
     ) -> MarkerSuggestionResult:
         if frame_index < 0:
             raise GeometryError(ErrorCode.GEOMETRY_INVALID, "frame_index cannot be negative", "frame_index")
-        self._sequence += 1
-        sequence = self._sequence
-        thresholds = self._thresholds
-        continuity_reference = previous_tip if previous_tip is not None else self._last_confirmed_tip
+        with self._state_lock:
+            self._sequence += 1
+            sequence = self._sequence
+            thresholds = self._thresholds
+            continuity_reference = previous_tip if previous_tip is not None else self._last_confirmed_tip
 
         scan = self._detector.scan(frame, thresholds, roi, cancellation=cancellation)
         if cancellation is not None and cancellation.is_cancelled():

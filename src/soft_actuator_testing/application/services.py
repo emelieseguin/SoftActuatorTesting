@@ -43,7 +43,14 @@ class ArtifactStore(Protocol):
 
     def save(self, document: ArtifactDocument) -> None: ...
 
-    def import_legacy(self, source: Path, artifact_type: ArtifactType) -> ArtifactDocument: ...
+    def import_legacy(
+        self,
+        source: Path,
+        artifact_type: ArtifactType,
+        *,
+        frame_size: tuple[int, int] | None = None,
+        frame_rate_hz: float | None = None,
+    ) -> ArtifactDocument: ...
 
     def export_legacy(self, document: ArtifactDocument, destination: Path) -> None: ...
 

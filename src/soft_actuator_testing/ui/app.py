@@ -7,21 +7,6 @@ deterministic demo environment and never construct hardware adapters.
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
-
-from soft_actuator_testing.ui.demo import build_demo_environment
-from soft_actuator_testing.ui.presenters import SnapshotStore, bind_text
-from soft_actuator_testing.ui.shells.experiment_studio import (
-    ExperimentStudioWindow,
-    create_experiment_studio_shell,
-)
-from soft_actuator_testing.ui.shells.instrument_console import (
-    InstrumentConsoleWindow,
-    create_instrument_console_shell,
-)
-from soft_actuator_testing.ui.themes import DARK_THEME, LIGHT_THEME, SemanticState, apply_theme
-from soft_actuator_testing.ui.widgets import NotificationCenter, PlotCanvas, StatusIndicator, VideoCanvas
-
 DEFAULT_SHELL = "instrument-console"
 EXPERIMENT_STUDIO_PROTOTYPE = "experiment-studio"
 
@@ -32,6 +17,13 @@ def _run_state_label(run_state) -> str:
 
 def _build_foundation_window(env=None) -> QMainWindow:
     """Assemble one window exercising the foundation with deterministic demo data."""
+
+    from PySide6.QtWidgets import QMainWindow, QVBoxLayout, QWidget
+
+    from soft_actuator_testing.ui.demo import build_demo_environment
+    from soft_actuator_testing.ui.presenters import SnapshotStore, bind_text
+    from soft_actuator_testing.ui.themes import DARK_THEME, SemanticState
+    from soft_actuator_testing.ui.widgets import NotificationCenter, PlotCanvas, StatusIndicator, VideoCanvas
 
     demo_environment = env or build_demo_environment()
 
@@ -96,13 +88,36 @@ def create_application_window(
     *,
     prototype_shell: str | None = None,
     production: bool = False,
-) -> InstrumentConsoleWindow | ExperimentStudioWindow:
-    """Create the selected demo-backed shell without constructing hardware adapters."""
+) -> object:
+    """Create the selected demo-backed shell without constructing hardware adapters.
 
-    if production and prototype_shell is None:
+    ``production`` and ``prototype_shell`` are mutually exclusive: prototype
+    shells (currently only Experiment Studio) are always a demo-only
+    development comparison and never a second production shell (see ADR
+    0005). The CLI (``bootstrap.py``) rejects this combination before it ever
+    reaches this function; this check is a second, programmatic-caller-facing
+    guard so the precedence stays unambiguous regardless of entry point.
+    """
+
+    if production and prototype_shell is not None:
+        raise ValueError(
+            f"production=True is incompatible with prototype_shell={prototype_shell!r}: "
+            "prototype shells are a demo-only development comparison, never a second "
+            "production shell. Pass only one of production=True or a prototype_shell."
+        )
+    if production:
         from soft_actuator_testing.ui.production import create_production_composition
 
         return create_production_composition().window
+    from soft_actuator_testing.ui.shells.experiment_studio import (
+        ExperimentStudioWindow,
+        create_experiment_studio_shell,
+    )
+    from soft_actuator_testing.ui.shells.instrument_console import (
+        InstrumentConsoleWindow,
+        create_instrument_console_shell,
+    )
+
     if prototype_shell is None:
         return create_instrument_console_shell()
     if prototype_shell == EXPERIMENT_STUDIO_PROTOTYPE:
@@ -112,6 +127,10 @@ def create_application_window(
 
 def run_application(*, prototype_shell: str | None = None, production: bool = False) -> int:
     """Show the selected shell using deterministic, hardware-disconnected services."""
+
+    from PySide6.QtWidgets import QApplication
+
+    from soft_actuator_testing.ui.themes import DARK_THEME, LIGHT_THEME, apply_theme
 
     application = QApplication.instance() or QApplication([])
     application.setApplicationName("Soft Actuator Testing")

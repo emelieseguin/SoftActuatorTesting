@@ -15,6 +15,7 @@ class ErrorCode(str, Enum):
     GEOMETRY_INVALID = "geometry_invalid"
     ILLEGAL_TRANSITION = "illegal_transition"
     ARTIFACT_INVALID = "artifact_invalid"
+    ARTIFACT_PUBLICATION_UNCERTAIN = "artifact_publication_uncertain"
 
 
 @dataclass(frozen=True)

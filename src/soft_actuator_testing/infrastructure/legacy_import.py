@@ -101,6 +101,8 @@ class LegacyArtifactImporter:
     def _calibration(self, source: Path) -> ArtifactDocument:
         data = self._json(source)
         model = self._mapping(data.get("model"), "model")
+        self._exact_keys(data, {"model", "samples"}, "root")
+        self._exact_keys(model, {"type", "coeffs"}, "model")
         model_type = self._string(model.get("type"), "model.type")
         coeffs = self._list(model.get("coeffs"), "model.coeffs")
         expected = 2 if model_type == "linear" else 3 if model_type == "quadratic" else 0
@@ -132,23 +134,43 @@ class LegacyArtifactImporter:
 
     def _geometry(self, source: Path, frame_size: tuple[int, int]) -> ArtifactDocument:
         width, height = frame_size
-        if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
+        if (
+            not isinstance(width, int)
+            or isinstance(width, bool)
+            or not isinstance(height, int)
+            or isinstance(height, bool)
+            or width <= 0
+            or height <= 0
+        ):
             raise self._error("frame dimensions must be positive integers", "frame_size")
         data = self._json(source)
         base = self._point(data.get("angle_base_point"), "angle_base_point", width, height)
         tip = self._point(data.get("angle_tip_point"), "angle_tip_point", width, height)
+        self._exact_keys(data, {"angle_base_point", "angle_tip_point", "actuator_roi"}, "root")
         roi = self._mapping(data.get("actuator_roi"), "actuator_roi")
         if {"x", "y", "w", "h"} <= roi.keys():
+            self._exact_keys(roi, {"x", "y", "w", "h"}, "actuator_roi")
             x, y = self._number(roi["x"], "actuator_roi.x"), self._number(roi["y"], "actuator_roi.y")
-            right, bottom = x + self._number(roi["w"], "actuator_roi.w"), y + self._number(roi["h"], "actuator_roi.h")
+            roi_width = self._number(roi["w"], "actuator_roi.w")
+            roi_height = self._number(roi["h"], "actuator_roi.h")
+            if roi_width <= 0:
+                raise self._error("ROI width must be positive", "actuator_roi.w")
+            if roi_height <= 0:
+                raise self._error("ROI height must be positive", "actuator_roi.h")
+            right, bottom = x + roi_width, y + roi_height
         elif {"top_left", "bottom_right"} <= roi.keys():
+            self._exact_keys(roi, {"top_left", "bottom_right"}, "actuator_roi")
             first = self._point(roi["top_left"], "actuator_roi.top_left", width, height)
             second = self._point(roi["bottom_right"], "actuator_roi.bottom_right", width, height)
+            if first["x"] >= second["x"] or first["y"] >= second["y"]:
+                raise self._error(
+                    "top_left must be above and left of bottom_right",
+                    "actuator_roi",
+                )
             x, y, right, bottom = first["x"], first["y"], second["x"], second["y"]
         else:
             raise self._error("ROI must contain x/y/w/h or top_left/bottom_right", "actuator_roi")
-        left, top = min(x, right), min(y, bottom)
-        right, bottom = max(x, right), max(y, bottom)
+        left, top = x, y
         if not (0 <= left < right <= width and 0 <= top < bottom <= height):
             raise self._error(
                 "ROI must be non-empty and within source frame bounds",
@@ -221,35 +243,61 @@ class LegacyArtifactImporter:
     def _json(self, source: Path) -> Mapping[str, Any]:
         try:
             with source.open(encoding="utf-8") as handle:
-                return self._mapping(json.load(handle), "root")
-        except (OSError, json.JSONDecodeError) as error:
+                def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                    result: dict[str, Any] = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError(f"duplicate key {key!r}")
+                        result[key] = value
+                    return result
+
+                value = json.load(handle, object_pairs_hook=unique_object)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
             raise self._error(f"cannot read legacy JSON: {error}", "source") from error
+        return self._mapping(value, "root")
 
     def _read_csv(self, source: Path, expected_header: tuple[str, ...]) -> list[dict[str, str]]:
         try:
             with source.open(newline="", encoding="utf-8") as handle:
-                reader = csv.DictReader(handle)
-                if tuple(reader.fieldnames or ()) != expected_header:
+                reader = csv.reader(handle, strict=True)
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    raise self._error("legacy CSV must contain a header", "header") from None
+                if tuple(header) != expected_header:
                     raise self._error(f"expected CSV header {','.join(expected_header)}", "header")
-                return list(reader)
-        except OSError as error:
+                rows: list[dict[str, str]] = []
+                for line_number, values in enumerate(reader, start=2):
+                    if len(values) != len(expected_header):
+                        raise self._error("CSV row has the wrong number of fields", f"row[{line_number}]")
+                    rows.append(dict(zip(expected_header, values, strict=True)))
+                return rows
+        except (OSError, UnicodeError, csv.Error) as error:
             raise self._error(f"cannot read legacy CSV: {error}", "source") from error
 
     def _point(self, value: Any, path: str, width: int, height: int) -> dict[str, float]:
         point = self._mapping(value, path)
         x, y = self._number(point.get("x"), f"{path}.x"), self._number(point.get("y"), f"{path}.y")
+        self._exact_keys(point, {"x", "y"}, path)
         if not (0 <= x < width and 0 <= y < height):
             raise self._error("point is outside source frame bounds", path)
         return {"x": x, "y": y}
 
     def _atomic_create(self, target: Path, content: str) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise self._error(f"cannot create legacy export directory: {error}", "destination") from error
+        reservation_stat: os.stat_result | None = None
         try:
             reservation = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as error:
             raise self._error("refusing to overwrite an existing export", "destination") from error
         else:
-            os.close(reservation)
+            try:
+                reservation_stat = os.fstat(reservation)
+            finally:
+                os.close(reservation)
         temporary: Path | None = None
         replaced = False
         try:
@@ -261,11 +309,14 @@ class LegacyArtifactImporter:
             os.replace(temporary, target)
             replaced = True
             temporary = None
+            self._fsync_directory(target.parent)
+        except OSError as error:
+            raise self._error(f"atomic legacy export failed: {error}", "destination") from error
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             if not replaced:
-                target.unlink(missing_ok=True)
+                self._remove_reservation(target, reservation_stat)
 
     @staticmethod
     def _csv_text(header: tuple[str, ...], rows: Any) -> str:
@@ -285,6 +336,13 @@ class LegacyArtifactImporter:
         if not isinstance(value, Mapping):
             raise self._error("must be an object", path)
         return value
+
+    def _exact_keys(self, value: Mapping[str, Any], expected: set[str], path: str) -> None:
+        if set(value) != expected:
+            raise self._error(
+                f"must contain exactly {','.join(sorted(expected))}",
+                path,
+            )
 
     def _list(self, value: Any, path: str) -> list[Any]:
         if not isinstance(value, list):
@@ -320,3 +378,24 @@ class LegacyArtifactImporter:
         if value in (None, "", "nan", "NaN", "NAN"):
             return None
         return self._number(value, path)
+
+    @staticmethod
+    def _remove_reservation(target: Path, reservation_stat: os.stat_result | None) -> None:
+        if reservation_stat is None:
+            return
+        try:
+            current = target.stat()
+            if current.st_ino == reservation_stat.st_ino and current.st_dev == reservation_stat.st_dev:
+                target.unlink()
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        if os.name == "nt":
+            return
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)

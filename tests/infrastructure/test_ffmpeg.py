@@ -9,6 +9,7 @@ import pytest
 
 from soft_actuator_testing.infrastructure.ffmpeg import (
     CameraInputProfile,
+    CaptureStoragePolicy,
     FfmpegProbeError,
     FfmpegTools,
     FfmpegUnavailableError,
@@ -20,6 +21,7 @@ from soft_actuator_testing.infrastructure.ffmpeg import (
     build_profile_list_command,
     estimate_storage,
     parse_negotiated_profile,
+    parse_camera_modes,
     probe_capabilities,
     select_runtime_encoder,
     verify_video,
@@ -220,6 +222,53 @@ def test_storage_estimate_exposes_free_space_hook(tmp_path: Path) -> None:
     assert estimate.recording_bytes == 200
     assert estimate.required_free_bytes == 300
     assert estimate.fits
+
+
+def test_capture_storage_policy_uses_nonzero_conservative_default_and_refuses_full_disk(
+    tmp_path: Path,
+) -> None:
+    policy = CaptureStoragePolicy(
+        default_duration_seconds=30,
+        bytes_per_second=20,
+        reserve_bytes=100,
+    )
+    estimate = policy.estimate(
+        tmp_path / "new-run",
+        None,
+        disk_usage=lambda path: shutil._ntuple_diskusage(1_000, 601, 599),
+    )
+
+    assert estimate.duration_seconds == 30
+    assert estimate.recording_bytes == 600
+    assert estimate.required_free_bytes == 700
+    assert not estimate.fits
+    with pytest.raises(OSError, match="Insufficient free storage.*need 700"):
+        policy.preflight(
+            tmp_path / "new-run",
+            None,
+            disk_usage=lambda path: shutil._ntuple_diskusage(1_000, 601, 599),
+        )
+
+
+def test_mode_parser_retains_only_explicit_format_dimension_rate_evidence() -> None:
+    modes = parse_camera_modes(
+        """
+        [dshow]   vcodec=mjpeg  min s=3840x2160 fps=30 max s=3840x2160 fps=60
+        Pixel Format: 'YUYV'
+            Size: Discrete 1920x1080
+                Interval: Discrete 0.033s (30.000 fps)
+        Pixel Format: 'MJPG'
+            Size: Discrete 3840x2160
+                Interval: Discrete 0.016s (60.000 fps)
+        """
+    )
+
+    assert {(mode.width, mode.height, mode.fps, mode.pixel_format) for mode in modes} == {
+        (3840, 2160, 30.0, "mjpeg"),
+        (3840, 2160, 60.0, "mjpeg"),
+        (1920, 1080, 30.0, "yuyv"),
+        (3840, 2160, 60.0, "mjpg"),
+    }
 
 
 def test_ffprobe_verification_requires_a_readable_video_stream(tmp_path: Path) -> None:

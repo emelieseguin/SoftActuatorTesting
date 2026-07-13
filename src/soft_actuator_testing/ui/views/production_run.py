@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QCheckBox, QFormLayout, QLabel, QLineEdit, QSpinBox, QVBoxLayout, QWidget
 
 from soft_actuator_testing.application.camera_capture import CameraPanelPresenter
@@ -24,6 +25,7 @@ class ProductionConnectionsPage(QWidget):
         serial: SerialController,
         camera: CameraPanelPresenter | None,
         workspace: callable,
+        camera_auto_refresh: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -31,8 +33,18 @@ class ProductionConnectionsPage(QWidget):
         layout.addWidget(QLabel("Production device connections", self))
         self.serial_panel = SerialControlPanel(serial, self)
         layout.addWidget(self.serial_panel)
+        def reserve_camera_output():
+            root = workspace()
+            return camera.reserve_standalone_capture(root) if root is not None else None
+
         self.camera_panel = (
-            CameraPanel(camera, output_directory_provider=lambda: workspace() / "runs", parent=self)
+            CameraPanel(
+                camera,
+                output_directory_provider=reserve_camera_output,
+                output_available_provider=lambda: workspace() is not None,
+                auto_refresh=camera_auto_refresh,
+                parent=self,
+            )
             if camera is not None
             else QLabel("Camera capture unavailable: install FFmpeg/FFprobe or turn recording off.", self)
         )
@@ -85,7 +97,7 @@ class ProductionReadinessPage(QWidget):
                 cycles=self.cycles.value(),
                 on_milliseconds=self.on_ms.value(),
                 off_milliseconds=self.off_ms.value(),
-                workspace=Path(self._workspace()),
+                workspace=self._workspace(),
                 camera_device=device,
                 calibration=self._calibration(),
                 geometry=self._geometry(),
@@ -107,6 +119,15 @@ class ProductionLiveRunPage(QWidget):
         self.detail = QLabel(self); self.plot = PlotCanvas(title="Pressure", x_label="Time (s)", y_label="Pressure (kPa)")
         for widget in (self.start, self.stop, self.status, self.detail, self.plot): layout.addWidget(widget)
         self._timer = QTimer(self); self._timer.timeout.connect(self.refresh); self._timer.start(50); self.refresh()
+        # As a page embedded in a shell's stack, this widget never receives
+        # its own closeEvent when the owning window closes; the destroyed
+        # fallback guarantees the poll timer stops for as long as this
+        # object survives, regardless of how it is parented/closed.
+        self.destroyed.connect(self._timer.stop)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+        self._timer.stop()
+        super().closeEvent(event)
 
     def refresh(self) -> None:
         snapshot = self._run.snapshot

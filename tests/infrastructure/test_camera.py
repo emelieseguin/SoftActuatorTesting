@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import io
 import subprocess
 from pathlib import Path
+from threading import Event, RLock, Thread
 from time import monotonic, sleep
 
 import pytest
 
-from soft_actuator_testing.application.camera_capture import CaptureError, CapturePhase
+from soft_actuator_testing.application.camera_capture import (
+    CameraCaptureService,
+    CameraPanelPresenter,
+    CaptureError,
+    CapturePhase,
+)
 from soft_actuator_testing.infrastructure.camera import (
     FakeProcessFactory,
     FfmpegCameraDeviceSource,
@@ -83,6 +90,7 @@ def _backend(
     throughput_observer=None,
     graceful_timeout: float = 0.02,
     interrupt_timeout: float = 0.02,
+    drainer_timeout: float = 1.0,
 ) -> FfmpegCaptureBackend:
     return FfmpegCaptureBackend(
         _tools(tmp_path),
@@ -99,6 +107,7 @@ def _backend(
         preview_fps=10,
         graceful_timeout=graceful_timeout,
         interrupt_timeout=interrupt_timeout,
+        drainer_timeout=drainer_timeout,
         poll_interval=0.001,
         health_observer=health_observer,
         throughput_observer=throughput_observer,
@@ -135,18 +144,29 @@ def _wait_until(predicate, timeout: float = 1.0) -> None:
 
 def test_real_device_source_enumerates_without_opening_devices(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
-    result = subprocess.CompletedProcess(
-        [],
-        1,
-        "",
-        '[dshow @ 000] "USB Camera" (video)\n[dshow @ 000] "IR Camera" (video)\n',
-    )
+    def runner(command, **_kwargs):
+        if "-list_devices" in command:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                '[dshow @ 000] "USB Camera" (video)\n[dshow @ 000] "IR Camera" (video)\n',
+            )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "",
+            "vcodec=mjpeg min s=3840x2160 fps=60 max s=3840x2160 fps=60\n",
+        )
+
     windows = FfmpegCameraDeviceSource(
         tools,
         platform="win32",
-        runner=lambda *args, **kwargs: result,
+        runner=runner,
     )
-    assert [device.identifier for device in windows.devices()] == ["USB Camera", "IR Camera"]
+    windows_devices = windows.devices()
+    assert [device.identifier for device in windows_devices] == ["USB Camera", "IR Camera"]
+    assert windows_devices[0].modes[0].matches()
     assert windows.profile_command("USB Camera")[-1] == "video=USB Camera"
 
     device_root = tmp_path / "dev"
@@ -159,6 +179,44 @@ def test_real_device_source_enumerates_without_opening_devices(tmp_path: Path) -
     )
     assert [device.name for device in linux.devices()] == ["video0"]
     assert linux.profile_command(str(device_root / "video0"))[-1].endswith("video0")
+
+
+def test_v4l2_format_list_without_frame_rates_allows_startup_profile_proof(
+    tmp_path: Path,
+) -> None:
+    device_root = tmp_path / "dev"
+    device_root.mkdir()
+    device = device_root / "video0"
+    device.write_bytes(b"")
+    v4l2_list_formats_output = """
+[video4linux2,v4l2 @ 0x1] Raw       :     yuyv422 : YUYV 4:2:2 : 640x480 1920x1080
+[video4linux2,v4l2 @ 0x1] Compressed:        mjpeg : Motion-JPEG : 640x480 3840x2160
+"""
+    source = FfmpegCameraDeviceSource(
+        _tools(tmp_path),
+        platform="linux",
+        linux_device_directory=device_root,
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            1,
+            "",
+            v4l2_list_formats_output,
+        ),
+    )
+    backend = _backend(tmp_path, _factory(tmp_path))
+    presenter = CameraPanelPresenter(source, CameraCaptureService(backend))
+
+    presenter.refresh_devices()
+
+    snapshot = presenter.state.snapshot
+    assert snapshot.devices[0].modes == ()
+    assert "omits frame rates" in snapshot.devices[0].mode_probe_warning
+    assert snapshot.can_start
+    assert "will be verified at capture startup" in snapshot.status_text
+
+    presenter.start_capture(tmp_path / "run", readiness_timeout=0.5)
+    _wait_until(lambda: backend.health.phase is CapturePhase.RECORDING)
+    backend.stop()
 
 
 def test_slow_preview_consumer_never_blocks_recording_and_replaces_stale_frames(
@@ -250,6 +308,52 @@ def test_malformed_progress_is_reported_without_killing_capture(tmp_path: Path) 
     backend.stop()
 
 
+def test_health_sampling_does_not_overwrite_a_concurrent_warning_fault_or_clean_state(tmp_path: Path) -> None:
+    class SnapshotInterleavingLock:
+        """Reproduces the former lock-release window without timing races."""
+
+        def __init__(self) -> None:
+            self._lock = RLock()
+            self.snapshot_released = Event()
+            self.allow_sample_to_finish = Event()
+            self._releases = 0
+
+        def __enter__(self) -> SnapshotInterleavingLock:
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self._lock.release()
+            self._releases += 1
+            if self._releases == 1:
+                self.snapshot_released.set()
+                assert self.allow_sample_to_finish.wait(1)
+
+    backend = _backend(tmp_path, _factory(tmp_path))
+    interleaving_lock = SnapshotInterleavingLock()
+    backend._lock = interleaving_lock  # type: ignore[assignment]
+
+    sampler = Thread(target=backend._sample)
+    sampler.start()
+    assert interleaving_lock.snapshot_released.wait(1)
+
+    def report_fault() -> None:
+        backend._add_warning("injected concurrent warning")
+        backend._set_health(CapturePhase.FAULT, ready=False, clean=False)
+        interleaving_lock.allow_sample_to_finish.set()
+
+    updater = Thread(target=report_fault)
+    updater.start()
+    updater.join(1)
+    sampler.join(1)
+
+    assert not updater.is_alive()
+    assert not sampler.is_alive()
+    assert backend.health.phase is CapturePhase.FAULT
+    assert backend.health.clean is False
+    assert "injected concurrent warning" in backend.health.warnings
+
+
 def test_invalid_ffprobe_result_keeps_partial_for_diagnostics(tmp_path: Path) -> None:
     backend = _backend(tmp_path, _factory(tmp_path), readable=False)
     run = tmp_path / "run"
@@ -289,6 +393,117 @@ def test_timeout_escalates_to_interrupt_then_kill(tmp_path: Path) -> None:
     assert process.signals
     assert process.killed
     assert not result.clean
+
+
+def test_cyclic_completion_reason_promotes_after_cooperative_shutdown(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, _factory(tmp_path))
+    run = tmp_path / "run"
+    backend.start(run, "/dev/video0", readiness_timeout=0.5)
+
+    result = backend.stop("controller cyclic completion")
+
+    assert result.completion_reason == "controller cyclic completion"
+    assert result.clean
+    assert result.video_path == run / "video.mkv"
+    assert result.health.phase is CapturePhase.COMPLETED
+    assert result.evidence.cooperative_shutdown
+    assert result.evidence.promoted
+
+
+def test_unjoined_preview_drainer_retains_readable_partial(tmp_path: Path) -> None:
+    class StuckPreviewStream:
+        def __init__(self, payload: bytes) -> None:
+            self._source = io.BytesIO(payload)
+            self._blocked = Event()
+
+        def read(self, size: int = -1) -> bytes:
+            value = self._source.read(size)
+            if value:
+                return value
+            self._blocked.wait(10)
+            return b""
+
+    def supply(command):
+        partial = next(Path(item) for item in command if str(item).endswith("video.partial.mkv"))
+        partial.write_bytes(b"partial-video")
+        process = ScriptedProcess(
+            stdout=b"",
+            stderr=_stderr(),
+        )
+        process.stdout = StuckPreviewStream(b"\x10\x20\x30\x40\x50\x60")  # type: ignore[assignment]
+        return process
+
+    backend = _backend(
+        tmp_path,
+        FakeProcessFactory(supply),
+        drainer_timeout=0.02,
+    )
+    run = tmp_path / "run"
+    backend.start(run, "/dev/video0", readiness_timeout=0.5)
+
+    result = backend.stop("controller cyclic completion")
+
+    assert result.readable
+    assert not result.clean
+    assert result.video_path is None
+    assert result.partial_path.is_file()
+    assert not result.evidence.drainers_stopped
+    assert not result.evidence.promoted
+
+
+def test_backend_defers_encoder_selection_until_capture_start(tmp_path: Path) -> None:
+    selected = EncoderSelection(
+        name="runtime-selected",
+        output_arguments=("-c:v", "libx264", "-preset", "ultrafast"),
+    )
+    selections: list[FfmpegTools] = []
+    backend = FfmpegCaptureBackend(
+        _tools(tmp_path),
+        platform="linux",
+        input_profile=CameraInputProfile(pixel_format="mjpeg"),
+        encoder_selector=lambda tools: selections.append(tools) or selected,
+        process_factory=_factory(tmp_path),
+        verifier=lambda path: _verification(),
+        preview_width=2,
+        preview_height=1,
+        preview_fps=10,
+        graceful_timeout=0.02,
+        interrupt_timeout=0.02,
+        poll_interval=0.001,
+    )
+
+    assert selections == []
+    backend.start(tmp_path / "run", "/dev/video0", readiness_timeout=0.5)
+
+    assert len(selections) == 1
+    assert selections[0].ffmpeg == tmp_path / "ffmpeg"
+    assert backend.health.encoder == "runtime-selected"
+    backend.stop()
+
+
+def test_kill_cleanup_failure_still_publishes_a_bounded_fault_result(tmp_path: Path) -> None:
+    class KillFailingProcess(ScriptedProcess):
+        def kill(self) -> None:
+            raise OSError("simulated kill failure")
+
+    def supply(command):
+        partial = next(Path(item) for item in command if str(item).endswith("video.partial.mkv"))
+        partial.write_bytes(b"partial-video")
+        return KillFailingProcess(
+            stdout=b"\x10\x20\x30\x40\x50\x60",
+            stderr=_stderr(),
+            quit_exits=False,
+            interrupt_exits=False,
+        )
+
+    backend = _backend(tmp_path, FakeProcessFactory(supply))
+    backend.start(tmp_path / "run", "/dev/video0", readiness_timeout=0.5)
+
+    result = backend.stop()
+
+    assert not result.clean
+    assert "kill cleanup failed" in result.error
+    assert result.health.phase is CapturePhase.FAULT
 
 
 def test_disconnect_and_close_use_the_same_finalizer(tmp_path: Path) -> None:

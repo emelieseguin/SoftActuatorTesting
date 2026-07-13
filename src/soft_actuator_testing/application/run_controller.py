@@ -12,9 +12,10 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
+import shlex
 from threading import Event, RLock, Thread, Timer, current_thread
 from time import monotonic
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from soft_actuator_testing.application.camera_capture import (
     CameraCaptureService,
@@ -32,13 +33,16 @@ from soft_actuator_testing.domain.run_state import (
     request_stop,
     transition,
 )
-from soft_actuator_testing.infrastructure.artifact_store import DurableRunArtifacts
 from soft_actuator_testing.infrastructure.serial_adapter import (
     CommandState,
     ErrorFrame,
     RunMarkerFrame,
+    SerialFrameSubscription,
     TelemetryFrame,
 )
+
+if TYPE_CHECKING:
+    from soft_actuator_testing.infrastructure.artifact_store import DurableRunArtifacts
 
 
 @dataclass(frozen=True)
@@ -47,7 +51,7 @@ class CyclicRunConfiguration:
     cycles: int
     on_milliseconds: int
     off_milliseconds: int
-    workspace: Path
+    workspace: Path | None
     camera_device: str
     calibration: CalibrationFit | None
     geometry: VideoGeometry | None
@@ -121,7 +125,13 @@ class LegacySerialRunPort(Protocol):
 
     def stop_legacy_run(self) -> object: ...
 
-    def poll(self, maximum: int | None = None) -> Sequence[object]: ...
+    def subscribe_frames(
+        self,
+        name: str,
+        *,
+        critical: bool = False,
+        capacity: int | None = None,
+    ) -> SerialFrameSubscription: ...
 
     def disconnect(self) -> object: ...
 
@@ -166,14 +176,19 @@ class RunController:
         self._start_command_sent = False
         self._stop_command_sent = False
         self._camera_started = False
+        self._camera_start_attempted = False
+        self._capture_result: CaptureResult | None = None
         self._cancel = Event()
         self._telemetry_worker: Thread | None = None
+        self._serial_subscription: SerialFrameSubscription | None = None
         self._start_worker: Thread | None = None
         self._final_result: RunFinalizationResult | None = None
         self._finalizing = False
         self._finalized = Event()
         self._generation = 0
         self._finalizing_generation: int | None = None
+        self._terminal_reason: str | None = None
+        self._requested_completion: RunCompletion | None = None
         self._watchdog: Timer | None = None
         self._finalize_wait_seconds = 5.0
 
@@ -188,6 +203,13 @@ class RunController:
                 run_id=self._artifacts.run_id if self._artifacts else None,
                 diagnostic_text=tuple(self._diagnostics),
             )
+
+    @property
+    def finalization_result(self) -> RunFinalizationResult | None:
+        """Expose the immutable finalized recording handoff, if a run ended."""
+
+        with self._lock:
+            return self._final_result
 
     def configure(self, configuration: CyclicRunConfiguration) -> RunReadiness:
         with self._lock:
@@ -263,9 +285,14 @@ class RunController:
             self._finalized.clear()
             self._finalizing = False
             self._finalizing_generation = None
+            self._terminal_reason = None
+            self._requested_completion = None
             self._start_command_sent = False
             self._stop_command_sent = False
             self._camera_started = False
+            self._camera_start_attempted = False
+            self._capture_result = None
+            self._serial_subscription = None
             self._artifacts = None
             self._telemetry = []
             self._started_at = datetime.now(timezone.utc)
@@ -279,11 +306,17 @@ class RunController:
             # frame, output progress, and a growing recording file are proven.
             if configuration.record_video:
                 assert self._camera is not None
-                self._camera.start_capture(
-                    artifacts.directory,
-                    configuration.camera_device,
-                    duration_seconds=None,
-                )
+                with self._lock:
+                    self._camera_start_attempted = True
+                try:
+                    self._camera.start_capture(
+                        artifacts.directory,
+                        configuration.camera_device,
+                        duration_seconds=None,
+                    )
+                except Exception:
+                    self._remember_camera_result()
+                    raise
                 camera_acquired = True
                 self._ensure_active(generation)
                 if not self._camera.health.ready:
@@ -292,6 +325,12 @@ class RunController:
                     self._ensure_active(generation)
                     self._camera_started = True
             assert self._serial is not None
+            with self._lock:
+                self._ensure_active(generation)
+                self._serial_subscription = self._serial.subscribe_frames(
+                    f"run-persistence-{generation}",
+                    critical=True,
+                )
             # Legacy ordering is intentionally exact.  No acknowledgement wait
             # is requested because the legacy profile has no confirmed ACK model.
             for command in (
@@ -317,11 +356,17 @@ class RunController:
             return self.snapshot
         except Exception as error:
             self._diagnose(f"run startup failed: {error}")
-            if camera_acquired and not self._camera_started and self._camera is not None:
+            if (
+                (camera_acquired or self._camera_start_attempted)
+                and not self._camera_started
+                and self._camera is not None
+                and self._capture_result is None
+            ):
                 try:
-                    self._camera.stop_capture("cancelled during startup")
+                    self._remember_capture_result(self._camera.stop_capture("cancelled during startup"))
                 except Exception as cleanup_error:
                     self._diagnose(f"camera cleanup after cancelled startup failed: {cleanup_error}")
+            self._remember_camera_result()
             # A cancellation/finalizer which won the race already owns cleanup.
             if self._is_active_generation(generation):
                 self.finalize(RunCompletion.FAULTED, reason="startup failure")
@@ -439,6 +484,8 @@ class RunController:
             else:
                 self._finalizing = True
                 self._finalizing_generation = self._generation
+                self._terminal_reason = reason
+                self._requested_completion = completion
                 waiter = None
                 if self._lifecycle.state in {RunState.STARTING, RunState.RUNNING}:
                     self._lifecycle = request_stop(self._lifecycle).snapshot
@@ -457,7 +504,8 @@ class RunController:
             return RunFinalizationResult(**{**self._final_result.__dict__, "idempotent": True})
 
         errors: list[str] = []
-        video_path: Path | None = None
+        capture = self._remember_camera_result()
+        video_path: Path | None = capture.video_path if capture is not None else None
         manifest_path: Path | None = None
         try:
             self._cancel.set()
@@ -474,16 +522,23 @@ class RunController:
                     self._stop_command_sent = True
                 except Exception as error:
                     errors.append(f"CMD:STOP failed: {error}")
-            if self._camera_started and self._camera is not None:
+            if (
+                (self._camera_started or self._camera_start_attempted)
+                and self._camera is not None
+                and capture is None
+            ):
                 try:
-                    capture = self._camera.stop_capture(reason)
+                    capture = self._remember_capture_result(self._camera.stop_capture(reason))
                     video_path = capture.video_path
-                    if not capture.clean:
-                        errors.append(capture.error or "camera finalization was not clean")
                 except Exception as error:
                     errors.append(f"camera cleanup failed: {error}")
+            capture = self._remember_camera_result() or capture
+            if capture is not None:
+                video_path = capture.video_path
+                if not capture.clean:
+                    errors.append(capture.error or "camera finalization was not clean")
             final_completion = RunCompletion.FAULTED if errors and completion is not RunCompletion.ABORTED else completion
-            payload = self._manifest_payload(final_completion, completion, reason, video_path, errors)
+            payload = self._manifest_payload(final_completion, completion, reason, capture, errors)
             if self._artifacts is not None:
                 try:
                     manifest_path = self._artifacts.finalize(payload)
@@ -507,18 +562,26 @@ class RunController:
                 self._final_result = result
                 return result
         finally:
+            subscription: SerialFrameSubscription | None = None
             with self._lock:
+                subscription = self._serial_subscription
+                self._serial_subscription = None
                 self._finalizing = False
                 self._finalizing_generation = None
                 self._finalized.set()
+            if subscription is not None:
+                subscription.close()
 
     def _poll_serial(self, generation: int) -> None:
         while not self._cancel.wait(0.02):
             try:
                 if not self._is_active_generation(generation):
                     return
-                assert self._serial is not None
-                self.ingest_frames(tuple(self._serial.poll()))
+                with self._lock:
+                    subscription = self._serial_subscription
+                if subscription is None:
+                    raise RuntimeError("run serial persistence subscription is unavailable")
+                self.ingest_frames(subscription.drain())
                 self._observe_camera(generation)
             except Exception as error:
                 self._diagnose(f"serial telemetry worker fault: {error}")
@@ -535,20 +598,27 @@ class RunController:
             if self._is_active_generation(generation):
                 self._artifacts = artifacts
                 return
-            completion = (
-                self._final_result.completion
-                if self._final_result is not None
-                else RunCompletion.ABORTED
-            )
-        # Finalization may win while storage reservation blocks.  Preserve the
-        # newly reserved diagnostic directory rather than leaking it.
-        artifacts.finalize(
-            {
-                "completion": completion.value,
-                "reason": "start cancelled while reserving artifacts",
-                "output_files": [f"runs/{artifacts.run_id}/pressure.csv"],
-            }
+            final_result = self._final_result
+            completion = final_result.completion if final_result is not None else RunCompletion.ABORTED
+            requested_completion = self._requested_completion or completion
+            reason = self._terminal_reason or "start cancelled while reserving artifacts"
+            self._artifacts = artifacts
+            capture = self._capture_result
+        # Finalization may win while storage reservation blocks.  It could not
+        # have written a manifest before a run directory existed, so publish the
+        # same complete terminal shape here exactly once rather than leaking a
+        # minimally described reservation.
+        payload = self._manifest_payload(
+            completion,
+            requested_completion,
+            reason,
+            self._remember_camera_result() or capture,
+            final_result.errors if final_result is not None else (),
         )
+        manifest_path = artifacts.finalize(payload)
+        with self._lock:
+            if self._generation == generation and self._final_result is not None:
+                self._final_result = replace(self._final_result, manifest_path=manifest_path)
         raise RuntimeError("run start was cancelled or superseded")
 
     def _ensure_active(self, generation: int) -> None:
@@ -683,18 +753,17 @@ class RunController:
         completion: RunCompletion,
         requested_completion: RunCompletion,
         reason: str,
-        video_path: Path | None,
+        capture_result: CaptureResult | None,
         errors: Sequence[str],
     ) -> Mapping[str, Any]:
         config = self._configuration
         assert config is not None
         run_id = self._artifacts.run_id if self._artifacts else ""
         output_files = [f"runs/{run_id}/pressure.csv"]
-        if video_path is not None and self._artifacts is not None:
-            try:
-                output_files.append(video_path.relative_to(self._artifacts.store.root).as_posix())
-            except ValueError:
-                self._diagnose(f"video path is outside workspace and cannot be portable: {video_path}")
+        capture = self._capture_manifest_evidence(config, capture_result, reason)
+        final_video = capture["paths"]["final_path"]
+        if final_video is not None:
+            output_files.append(final_video)
         return {
             "completion": completion.value,
             "requested_completion": requested_completion.value,
@@ -711,9 +780,10 @@ class RunController:
             "camera": {
                 "device": config.camera_device,
                 "requested_profile": config.camera_profile.label,
-                "finalized_video": output_files[-1] if video_path is not None else None,
-                "health": self._capture_provenance(),
+                "finalized_video": final_video,
+                "health": capture["health"],
             },
+            "capture": capture,
             "pressure_csv": {
                 "path": output_files[0],
                 "columns": ["schema_version", "artifact_id", "time_s", "volts", "pressure_kPa"],
@@ -740,10 +810,297 @@ class RunController:
             raise RuntimeError("run has not been configured")
         return self._configuration
 
-    def _capture_provenance(self) -> Mapping[str, Any]:
+    def _remember_camera_result(self) -> CaptureResult | None:
+        """Cache a terminal camera result exposed by the capture service."""
+
         if self._camera is None:
+            return None
+        try:
+            result = getattr(self._camera, "result", None)
+        except Exception as error:
+            self._diagnose(f"could not read camera finalization evidence: {error}")
+            return None
+        return self._remember_capture_result(result)
+
+    def _remember_capture_result(self, result: CaptureResult | None) -> CaptureResult | None:
+        if result is None:
+            with self._lock:
+                return self._capture_result
+        if not isinstance(result, CaptureResult):
+            self._diagnose("camera returned an unsupported finalization result; capture evidence is unavailable")
+            with self._lock:
+                return self._capture_result
+        with self._lock:
+            if self._capture_result is None:
+                self._capture_result = result
+            return self._capture_result
+
+    def _capture_manifest_evidence(
+        self,
+        config: CyclicRunConfiguration,
+        result: CaptureResult | None,
+        controller_reason: str,
+    ) -> Mapping[str, Any]:
+        """Serialize only capture facts exposed by the typed application contract."""
+
+        health = result.health if result is not None else self._capture_health()
+        evidence = result.evidence if result is not None else None
+        profile = health.negotiated_profile if health is not None else None
+        preview = health.preview if health is not None else None
+        final_path = self._capture_workspace_path(result.video_path) if result is not None else None
+        partial_path = (
+            self._capture_workspace_path(result.partial_path, require_file=True)
+            if result is not None
+            else None
+        )
+        ffmpeg_command = self._capture_command()
+        ffmpeg_version = self._capture_optional_text("ffmpeg_version")
+        ffmpeg_build = self._capture_optional_text("ffmpeg_build")
+        status = self._capture_status(config, result, health, partial_path)
+        promoted = evidence.promoted if evidence is not None else None
+
+        return {
+            "status": status,
+            "requested_target": {
+                "width": config.camera_profile.width,
+                "height": config.camera_profile.height,
+                "fps": config.camera_profile.fps,
+                "label": config.camera_profile.label,
+            },
+            "selected_device": {
+                "identifier": config.camera_device or None,
+                "backend": self._capture_optional_text("backend"),
+                "mode": self._capture_mode(),
+            },
+            "encoder": None if health is None or not health.encoder else health.encoder,
+            "ffmpeg": {
+                "command": ffmpeg_command,
+                "version": ffmpeg_version,
+                "build": ffmpeg_build,
+            },
+            "startup": {
+                "proven": evidence.startup_proven if evidence is not None else None,
+                "proof_at": None,
+                "components": {
+                    "negotiated_profile": profile is not None,
+                    "progress": None if health is None else health.frame > 0,
+                    "output_file": None if health is None else health.output_bytes > 0,
+                    "preview": None if preview is None else preview.produced > 0,
+                },
+            },
+            "negotiated": self._negotiated_profile(profile),
+            "progress": {
+                "frames": None if health is None else health.frame,
+                "fps": None if health is None else health.fps,
+                "speed": None if health is None else health.speed,
+                "output_time_us": None if health is None else health.output_time_us,
+                "file_size_bytes": None if health is None else health.output_bytes,
+                "duplicate_frames": None if health is None else health.duplicate_frames,
+                "dropped_frames": None if health is None else health.dropped_frames,
+                "malformed_progress_lines": None if health is None else health.malformed_progress_lines,
+            },
+            "preview": {
+                "received_frames": None if preview is None else preview.produced,
+                "consumed_frames": None if preview is None else preview.consumed,
+                "dropped_frames": None if preview is None else preview.replaced_stale,
+                "latest_timestamp": None,
+                "rate_fps": None,
+                "profile": None,
+                "maximum_age_seconds": None if preview is None else preview.maximum_age_seconds,
+            },
+            "health": self._capture_provenance(health),
+            "warnings": None if health is None else list(health.warnings),
+            "termination": {
+                "controller_reason": controller_reason,
+                "stop_reason": None if result is None else result.completion_reason,
+                "failure": None if result is None or not result.error else result.error,
+                "clean": None if result is None else result.clean,
+                "cooperative_shutdown": None if evidence is None else evidence.cooperative_shutdown,
+                "process_exit_code": None if evidence is None else evidence.process_exit_code,
+                "drainers_stopped": None if evidence is None else evidence.drainers_stopped,
+                "shutdown_escalated": None if evidence is None else evidence.shutdown_escalated,
+            },
+            "verification": {
+                "readable": None if result is None else result.readable,
+                "evidence_readable": None if evidence is None else evidence.verification_readable,
+                "duration_seconds": None,
+                "frame_count": None,
+                "streams": None,
+            },
+            "paths": {
+                "partial_path": partial_path,
+                "final_path": final_path,
+            },
+            "promotion": {
+                "promoted": promoted,
+                "outcome": self._promotion_outcome(result, partial_path, promoted),
+            },
+        }
+
+    def _capture_health(self) -> Any | None:
+        if self._camera is None:
+            return None
+        try:
+            return self._camera.health
+        except Exception as error:
+            self._diagnose(f"could not read camera health evidence: {error}")
+            return None
+
+    def _capture_workspace_path(self, path: Path | None, *, require_file: bool = False) -> str | None:
+        if path is None or self._artifacts is None:
+            return None
+        candidate = Path(path)
+        root = self._artifacts.store.root
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+        elif candidate.parts and candidate.parts[0] == "runs":
+            resolved = (root / candidate).resolve()
+        else:
+            resolved = (self._artifacts.directory / candidate).resolve()
+        try:
+            relative_path = resolved.relative_to(root).as_posix()
+        except ValueError:
+            self._diagnose(f"capture path is outside workspace and cannot be persisted: {path}")
+            return None
+        return relative_path if not require_file or resolved.is_file() else None
+
+    def _capture_command(self) -> list[str] | None:
+        if self._camera is None:
+            return None
+        value = getattr(self._camera, "ffmpeg_command", None)
+        if value is None:
+            value = getattr(self._camera, "command", None)
+        if isinstance(value, str):
+            try:
+                command = shlex.split(value)
+            except ValueError:
+                return None
+        elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+            command = [str(part) for part in value]
+        else:
+            return None
+        sanitized: list[str] = []
+        redact_next = False
+        for index, part in enumerate(command):
+            if redact_next:
+                sanitized.append("<redacted>")
+                redact_next = False
+                continue
+            sanitized.append(self._sanitize_command_part(part, index))
+            redact_next = self._is_sensitive_command_option(part)
+        return sanitized
+
+    @staticmethod
+    def _is_sensitive_command_option(part: str) -> bool:
+        option = part.strip().lstrip("-").casefold().replace("-", "_")
+        return option in {
+            "password",
+            "token",
+            "secret",
+            "credential",
+            "api_key",
+            "apikey",
+            "key",
+            "headers",
+            "http_headers",
+        }
+
+    def _sanitize_command_part(self, part: str, index: int) -> str:
+        value = part.strip()
+        lowered = value.casefold()
+        if not value:
+            return value
+        if any(marker in lowered for marker in ("password=", "token=", "secret=", "credential=", "api_key=")):
+            key, _, _ = value.partition("=")
+            return f"{key}=<redacted>"
+        if "$" in value or value.startswith("%"):
+            return "<environment-value>"
+        if "://" in value or value.casefold().startswith("file:"):
+            return "<external-url>"
+        if "=" in value:
+            key, _, assigned_value = value.partition("=")
+            if Path(assigned_value).expanduser().is_absolute():
+                return f"{key}=<external-path>"
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            if self._artifacts is not None:
+                try:
+                    return path.resolve().relative_to(self._artifacts.store.root).as_posix()
+                except ValueError:
+                    pass
+            return path.name if index == 0 else "<external-path>"
+        return value
+
+    def _capture_optional_text(self, attribute: str) -> str | None:
+        if self._camera is None:
+            return None
+        value = getattr(self._camera, attribute, None)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def _capture_mode(self) -> Mapping[str, Any] | None:
+        if self._camera is None:
+            return None
+        mode = getattr(self._camera, "input_mode", None)
+        if mode is None:
+            return None
+        values = {
+            name: getattr(mode, name, None)
+            for name in ("width", "height", "fps", "pixel_format")
+        }
+        if any(value is None for value in values.values()):
+            return None
+        return values
+
+    @staticmethod
+    def _capture_status(
+        config: CyclicRunConfiguration,
+        result: CaptureResult | None,
+        health: Any | None,
+        partial_path: str | None,
+    ) -> str:
+        if not config.record_video:
+            return "disabled"
+        if result is not None:
+            if result.clean and result.video_path is not None:
+                return "completed"
+            if partial_path is not None:
+                return "retained_partial"
+            return "failed"
+        if health is None:
+            return "unavailable"
+        phase = getattr(health.phase, "value", health.phase)
+        return "startup_failed" if phase == "fault" else "unavailable"
+
+    @staticmethod
+    def _promotion_outcome(
+        result: CaptureResult | None,
+        partial_path: str | None,
+        promoted: bool | None,
+    ) -> str:
+        if result is None:
+            return "not_started"
+        if promoted:
+            return "promoted"
+        if partial_path is not None:
+            return "retained_partial"
+        return "not_promoted"
+
+    @staticmethod
+    def _negotiated_profile(profile: Any | None) -> Mapping[str, Any] | None:
+        if profile is None:
+            return None
+        return {
+            "width": profile.width,
+            "height": profile.height,
+            "fps": profile.fps,
+            "pixel_format": profile.pixel_format,
+            "codec": profile.codec,
+        }
+
+    @staticmethod
+    def _capture_provenance(health: Any | None) -> Mapping[str, Any]:
+        if health is None:
             return {"enabled": False}
-        health = self._camera.health
         profile = health.negotiated_profile
         return {
             "enabled": True,

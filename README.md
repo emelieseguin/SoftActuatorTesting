@@ -1,32 +1,26 @@
 # SoftActuatorTesting
 
-**Last Updated:** 2026-07-11
+**Last updated:** 2026-07-13
 
-A research repository for testing and characterising soft actuators. This project collects experimental data, analysis scripts, and results related to soft actuator performance evaluation.
+SoftActuatorTesting is a Python/PySide6 desktop application for calibrated
+soft-actuator experiments. The production **Instrument Console** implements
+workspace-managed artifacts, serial and calibration workflows, FFmpeg-backed
+recording/preview, video geometry and advisory marker suggestions, cyclic-run
+finalization, and recorded-video angle analysis with review, correction, and
+versioned export. Hardware remains disconnected until an operator explicitly
+discovers or connects it.
 
-## Overview
+The default production Analysis page is the real `AnalysisPage`, not a
+handoff-only placeholder: it accepts finalized recordings, performs
+authoritative offline analysis, and offers a clearly labeled provisional live
+preview. As of 2026-07-13, the documented default hardware-free test suite
+passes without failures; external-FFmpeg and physical-hardware tests remain
+opt-in. See [test and release](docs/test-and-release.md) for the dated
+verification record and release matrix.
 
-This repository supports experimental workflows for soft actuator testing, including:
+## Start from source
 
-- Data collection and logging from actuator test rigs
-- Analysis and post-processing of experimental results
-- Documentation of test procedures and configurations
-
-## Repository Structure
-
-| Path | Description |
-|------|-------------|
-| `README.md` | Project overview and documentation |
-| `src/soft_actuator_testing/` | Unified desktop application package |
-| `tests/` | Hardware-free tests and compatibility fixtures |
-| `docs/continuation-plan.md` | Current status, remaining plan, agent handoff, and restart prompt |
-| `docs/architecture/` | Accepted rewrite decisions and implementation test plans |
-| `LICENSE` | Project licence |
-
-## Getting Started
-
-Clone the repository, then reproduce the managed development environment with
-[`uv`](https://docs.astral.sh/uv/):
+Requires Python 3.10–3.13 and [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
 git clone https://github.com/emelieseguin/SoftActuatorTesting.git
@@ -35,42 +29,78 @@ uv sync
 uv run pytest
 ```
 
-The safe scaffold status check does not initialize hardware:
+Safe checks do not open a window, serial port, or camera:
 
 ```bash
 uv run soft-actuator-testing --no-gui
+uv run soft-actuator-testing --smoke-imports
 ```
 
-Running `uv run soft-actuator-testing` opens the current real-but-disconnected
-production composition. It does not connect to serial devices or cameras during
-startup. The production composition is an integration checkpoint and is not yet
-the complete ADR 0005-selected Instrument Console; see
-[`docs/continuation-plan.md`](docs/continuation-plan.md).
+Launch the real, disconnected production application:
 
-The complete populated Instrument Console prototype remains available with
-deterministic demo services:
+```bash
+uv run soft-actuator-testing
+```
+
+Deterministic demo services and the rejected comparison shell remain available
+for training/development only:
 
 ```bash
 uv run soft-actuator-testing --mode demo
-```
-
-The rejected Experiment Studio shell remains available only for development
-comparison:
-
-```bash
 uv run soft-actuator-testing --prototype experiment-studio
 ```
 
-## Implementation status
+Use `uv run soft-actuator-testing --help` for the complete CLI contract.
 
-Workspace, calibration, serial, FFmpeg recording/preview, manual geometry,
-guided red-marker suggestions, artifact persistence, and the core cyclic-run
-lifecycle are implemented with hardware-free coverage. Remaining work is the
-full production-shell composition, angle-analysis pipeline and review UI,
-quality hardening, Windows/Linux packaging, and operator/maintainer handoff.
-Physical 3840x2160 at 60 fps certification remains blocked on representative
-hardware and explicit acceptance thresholds.
+## FFmpeg and physical 4K60 status
 
-## Contributing
+FFmpeg and FFprobe are external prerequisites; they are not included in source
+or desktop bundles. Install a matching pair on `PATH`, or set
+`SOFT_ACTUATOR_FFMPEG` to the FFmpeg executable with `ffprobe` adjacent or on
+`PATH`. Without them, the application stays usable with camera capture
+disconnected and shows an actionable diagnostic.
 
-Please open an issue or pull request for any proposed changes or additions.
+The software requests 3840×2160 at 60 fps and has synthetic/software coverage,
+but **physical 4K60 is not certified**. Representative native Windows
+DirectShow and Linux V4L2 evidence plus owner-approved acceptance thresholds
+are still required. See the [hardware acceptance procedure](docs/hardware-4k60-acceptance.md).
+
+## Native desktop packages
+
+PyInstaller creates one-directory native bundles. Build and smoke each bundle
+on its target OS—never cross-build:
+
+```bash
+# Native Linux
+uv run python tools/package_desktop.py --platform linux
+uv run python tools/smoke_desktop.py --platform linux
+
+# Native Windows PowerShell
+uv run python tools/package_desktop.py --platform windows
+uv run python tools/smoke_desktop.py --platform windows
+```
+
+Configuration-only dry runs are safe on any host:
+
+```bash
+uv run python tools/package_desktop.py --platform linux --dry-run
+uv run python tools/package_desktop.py --platform windows --dry-run
+```
+
+A Linux bundle has been built and hardware-free-smoked natively. No Windows
+binary has been built or executed; a Windows release remains unverified until
+the native Windows commands succeed. Bundle, FFmpeg, and license obligations
+are detailed in [desktop packaging](docs/architecture/desktop-packaging.md) and
+[test and release](docs/test-and-release.md).
+
+## Documentation
+
+- [Operator guide](docs/operator-guide.md) and [troubleshooting](docs/troubleshooting.md)
+- [Maintainer guide](docs/maintainer-guide.md) and [artifact schemas](docs/artifact-schemas.md)
+- [Test and release guide](docs/test-and-release.md) and
+  [hardware acceptance](docs/hardware-4k60-acceptance.md)
+- [Architecture records](docs/architecture/README.md), [legacy inventory](docs/initial-implementation/README.md),
+  and the [software handoff](docs/continuation-plan.md)
+
+The project is licensed under [GPLv3](LICENSE). Runtime dependency and
+redistribution notes are in [dependency licenses](docs/architecture/dependency-licenses.md).

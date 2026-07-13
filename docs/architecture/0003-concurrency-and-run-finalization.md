@@ -37,6 +37,22 @@ and file-heavy analysis all run on worker threads/processes, never on the Qt
 GUI thread. Workers communicate with the UI through bounded queues and
 marshal only immutable snapshots/results — never live mutable state.
 
+### Serial frame fan-out — 2026-07-13
+
+The serial reader is the sole consumer of the transport and dispatches every
+immutable parsed frame to independently named subscriber queues. Diagnostics,
+calibration freshness capture, and active-run persistence must never drain a
+shared queue. Diagnostic queues are bounded and report every dropped frame;
+the run/end-marker/fault stream and active calibration capture are critical,
+unbounded streams so that they do not silently lose lifecycle evidence.
+
+Disconnect delivers a typed disconnect fault to every active stream, cancels
+pending acknowledgement waits, and retires subscriptions before another
+connection can start. A run therefore either persists every dispatched frame
+and sees its terminal marker/fault, or visibly finalizes as faulted; it never
+quietly loses a frame to diagnostic polling. Raw diagnostics cannot send
+`CMD:START`: only `RunController` may issue it after readiness and camera proof.
+
 ### Preview and analysis never starve recording
 
 - Full-resolution recording is the priority consumer of the camera feed.

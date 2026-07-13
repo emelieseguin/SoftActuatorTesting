@@ -279,6 +279,14 @@ class VideoGeometryWorkflow:
     def metadata(self) -> VideoMetadata | None:
         return self._open_video.metadata if self._open_video is not None else None
 
+    @property
+    def ready_geometry(self) -> VideoGeometry | None:
+        """Return the complete operator-authored geometry, if one is available."""
+
+        if not self.snapshot.is_ready:
+            return None
+        return self._domain_geometry()
+
     # --- video lifecycle ------------------------------------------------
     def load_video(self, source: Path, *, cancellation: CancellationToken | None = None) -> VideoMetadata:
         """Open ``source`` and reset the draft geometry; never fabricates a selection."""
@@ -286,6 +294,17 @@ class VideoGeometryWorkflow:
         source = Path(source)
         opened = self._reader.open(source, cancellation=cancellation)
         previous = self._open_video
+        if previous is not None:
+            try:
+                previous.close()
+            except Exception:
+                # The current workflow still owns ``previous``. Do not switch
+                # to a new handle until its resource is known to be released.
+                try:
+                    opened.close()
+                except Exception:
+                    pass
+                raise
         self._open_video = opened
         self._video_path = source
         self._frame_index = 0
@@ -296,8 +315,6 @@ class VideoGeometryWorkflow:
         self._view = ViewTransform()
         self._artifact_id = None
         self._message = f"Loaded {source.name}: {opened.metadata.frame_count} frame(s) at {opened.metadata.fps:g} fps."
-        if previous is not None:
-            previous.close()
         return opened.metadata
 
     def close_video(self) -> None:

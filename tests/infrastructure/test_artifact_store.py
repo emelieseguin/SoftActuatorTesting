@@ -73,6 +73,8 @@ def test_all_valid_legacy_fixtures_import_and_preserve_originals() -> None:
         ("calibration/invalid-linear-short-coeffs.json", ArtifactType.CALIBRATION, {}, "model.coeffs"),
         ("geometry/missing-points_config.json", ArtifactType.GEOMETRY, {"frame_size": (192, 128)}, "angle_base_point.x"),
         ("geometry/reverse-order-roi_config.json", ArtifactType.GEOMETRY, {"frame_size": (192, 128)}, "actuator_roi"),
+        ("geometry/negative-dimension-roi_config.json", ArtifactType.GEOMETRY, {"frame_size": (192, 128)}, "actuator_roi.w"),
+        ("geometry/reversed-corners-roi_config.json", ArtifactType.GEOMETRY, {"frame_size": (192, 128)}, "actuator_roi"),
         ("geometry/out-of-bounds-roi_config.json", ArtifactType.GEOMETRY, {"frame_size": (192, 128)}, "actuator_roi"),
         ("serial/command-lines.txt", ArtifactType.RUN_MANIFEST, {}, "artifact_type"),
         ("serial/telemetry-normal-with-markers.txt", ArtifactType.RUN_MANIFEST, {}, "artifact_type"),
@@ -190,6 +192,51 @@ def test_imported_legacy_angles_remain_explicit_after_versioned_csv_save(tmp_pat
     assert loaded.payload["rows"][1]["actuator_angle_degrees"] is None
 
 
+def test_prior_v1_analysis_csv_header_loads_and_resaves_without_losing_scientific_rows(tmp_path: Path) -> None:
+    store = ArtifactFileStore(tmp_path)
+    fixture = FIXTURES / "angle" / "versioned-v1-prior-header.csv"
+    target = tmp_path / "analysis" / "analysis_prior_v1" / "angles.csv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(fixture.read_bytes())
+
+    prior = store.load(ArtifactType.ANALYSIS_RESULTS, "analysis_prior_v1")
+
+    assert prior.payload == {
+        "rows": [
+            {
+                "frame_index": 0,
+                "video_time_seconds": 0.0,
+                "tip_x": 140.0,
+                "tip_y": 36.0,
+                "actuator_angle_degrees": -26.565051,
+                "detection_state": "detected",
+                "confidence": 0.9,
+                "correction_applied": False,
+            }
+        ]
+    }
+    resaved = _document(ArtifactType.ANALYSIS_RESULTS, dict(prior.payload), "analysis_prior_v1_resaved")
+    store.save(resaved)
+    resaved_path = tmp_path / "analysis" / "analysis_prior_v1_resaved" / "angles.csv"
+    assert "detection_reason" in resaved_path.read_text(encoding="utf-8").splitlines()[0]
+    assert store.load(ArtifactType.ANALYSIS_RESULTS, "analysis_prior_v1_resaved").payload == prior.payload
+
+
+def test_prior_v1_run_manifest_without_additive_capture_evidence_loads_unchanged(tmp_path: Path) -> None:
+    store = ArtifactFileStore(tmp_path)
+    fixture = FIXTURES / "run" / "versioned-v1-before-capture-evidence.json"
+    target = tmp_path / "runs" / "run_manifest_legacy_capture" / "run.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(fixture.read_bytes())
+
+    loaded = store.load(ArtifactType.RUN_MANIFEST, "run_manifest_legacy_capture")
+
+    assert loaded.payload == {
+        "completion": "clean",
+        "output_files": ["runs/run_manifest_legacy_capture/pressure.csv"],
+    }
+
+
 @pytest.mark.parametrize("frame_rate_hz", [None, 0.0, -1.0, float("nan")])
 def test_legacy_angle_import_requires_a_valid_source_frame_rate(frame_rate_hz: float | None) -> None:
     with pytest.raises(DomainError) as raised:
@@ -289,3 +336,122 @@ def test_newer_and_malformed_documents_fail_closed_with_field_paths(tmp_path: Pa
     with pytest.raises(DomainError) as raised:
         store.load(ArtifactType.WORKSPACE, "workspace_future")
     assert raised.value.field_path == "schema_version"
+
+
+def test_versioned_csv_round_trips_quoted_reasons_and_rejects_malformed_rows(tmp_path: Path) -> None:
+    store = ArtifactFileStore(tmp_path)
+    document = _document(
+        ArtifactType.ANALYSIS_RESULTS,
+        {
+            "rows": [
+                {
+                    "frame_index": 0,
+                    "video_time_seconds": 0.0,
+                    "tip_x": 1.0,
+                    "tip_y": 2.0,
+                    "actuator_angle_degrees": 3.0,
+                    "detection_state": "detected",
+                    "confidence": 1.0,
+                    "correction_applied": False,
+                    "detection_reason": 'candidate, "selected"',
+                }
+            ]
+        },
+        "analysis_quoted",
+    )
+    store.save(document)
+    path = tmp_path / "analysis" / "analysis_quoted" / "angles.csv"
+    assert 'candidate, ""selected""' in path.read_text(encoding="utf-8")
+    assert store.load(ArtifactType.ANALYSIS_RESULTS, "analysis_quoted").payload == document.payload
+
+    path.write_text(
+        "schema_version,artifact_id,frame_index,video_time_seconds,tip_x,tip_y,"
+        "actuator_angle_degrees,detection_state,confidence,correction_applied,detection_reason,legacy_import\n"
+        "1,analysis_quoted,0,0,1,2,3,detected,1,maybe,reason,false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DomainError) as invalid_bool:
+        store.load(ArtifactType.ANALYSIS_RESULTS, "analysis_quoted")
+    assert invalid_bool.value.field_path == "rows[0].correction_applied"
+
+    path.write_text(
+        "schema_version,artifact_id,frame_index,video_time_seconds,tip_x,tip_y,"
+        "actuator_angle_degrees,detection_state,confidence,correction_applied,detection_reason,legacy_import\n"
+        "1,other,0,0,1,2,3,detected,1,false,reason,false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DomainError) as mismatched_id:
+        store.load(ArtifactType.ANALYSIS_RESULTS, "analysis_quoted")
+    assert mismatched_id.value.field_path == "rows[0].artifact_id"
+
+
+def test_versioned_csv_rejects_empty_extra_and_nonfinite_rows(tmp_path: Path) -> None:
+    store = ArtifactFileStore(tmp_path)
+    directory = tmp_path / "analysis" / "analysis_invalid"
+    directory.mkdir(parents=True)
+    path = directory / "angles.csv"
+    header = (
+        "schema_version,artifact_id,frame_index,video_time_seconds,tip_x,tip_y,"
+        "actuator_angle_degrees,detection_state,confidence,correction_applied,detection_reason,legacy_import\n"
+    )
+    path.write_text(header + "\n", encoding="utf-8")
+    with pytest.raises(DomainError) as blank:
+        store.load(ArtifactType.ANALYSIS_RESULTS, "analysis_invalid")
+    assert blank.value.field_path == "row[2]"
+
+    path.write_text(header + "1,analysis_invalid,0,nan,1,2,3,detected,1,false,,false\n", encoding="utf-8")
+    with pytest.raises(DomainError) as nonfinite:
+        store.load(ArtifactType.ANALYSIS_RESULTS, "analysis_invalid")
+    assert nonfinite.value.field_path == "rows[0].video_time_seconds"
+
+
+def test_json_unknown_nonfinite_payload_and_symlink_escape_fail_closed(tmp_path: Path) -> None:
+    store = ArtifactFileStore(tmp_path)
+    with pytest.raises(DomainError) as nonfinite:
+        store.save(_document(ArtifactType.WORKSPACE, {"name": "test", "unknown": float("nan")}))
+    assert nonfinite.value.field_path == "payload.unknown"
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (tmp_path / "video").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(DomainError) as escaped:
+        store.resolve_workspace_path("video/source.avi")
+    assert escaped.value.field_path == "path"
+
+
+def test_atomic_finalization_error_retains_replaced_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ArtifactFileStore(tmp_path)
+    document = _document(ArtifactType.WORKSPACE, {"name": "durability"}, "workspace_durable")
+    target = tmp_path / "artifacts" / "workspace" / "workspace_durable.json"
+
+    def fail_directory_fsync(_directory: Path) -> None:
+        raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(store, "_fsync_directory", fail_directory_fsync)
+    with pytest.raises(DomainError, match="durability is uncertain") as raised:
+        store.save(document)
+    assert raised.value.code.name == "ARTIFACT_PUBLICATION_UNCERTAIN"
+    assert target.is_file()
+
+
+def test_legacy_import_rejects_unknown_json_fields_and_malformed_csv_rows(tmp_path: Path) -> None:
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(
+        json.dumps(
+            {
+                "model": {"type": "linear", "coeffs": [1.0, 0.0]},
+                "samples": [[1.0, 1.0]],
+                "unrecognized": "do not guess",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(DomainError) as unknown:
+        LegacyArtifactImporter().import_file(calibration, ArtifactType.CALIBRATION)
+    assert unknown.value.field_path == "root"
+
+    pressure = tmp_path / "pressure.csv"
+    pressure.write_text("time_s,volts,pressure_kPa\n0,1,,extra\n", encoding="utf-8")
+    with pytest.raises(DomainError) as malformed:
+        LegacyArtifactImporter().import_file(pressure, ArtifactType.PRESSURE_DATA)
+    assert malformed.value.field_path == "row[2]"

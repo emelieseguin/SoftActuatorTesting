@@ -82,6 +82,17 @@ platform diagnostics, capture negotiation/encoder/frame/drop health, and
 workspace-portable output references. Header-only pressure CSVs are valid for
 aborted/faulted runs that receive no telemetry.
 
+Each terminal `run.json` now also contains additive `capture` evidence. It
+captures every available typed `CaptureResult`/`CaptureHealth` fact (requested
+target, device/encoder, sanitized FFmpeg metadata, proof/negotiation,
+progress/preview, terminal cleanup, ffprobe readability, paths, and
+promotion). It uses `null` for unavailable optional facts rather than
+fabricating values, preserves partial paths only when workspace-relative, and
+does not link the separate standalone Connections status file. The manifest is
+written once by the shared finalizer; the capture result is cached before
+manifest assembly so a camera that has already finalized cannot lose terminal
+evidence.
+
 ## Test plan and evidence
 
 `tests/application/test_run_controller.py` uses only fakes. It verifies camera

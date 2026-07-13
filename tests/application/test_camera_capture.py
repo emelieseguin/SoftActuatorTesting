@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
@@ -9,6 +10,7 @@ import pytest
 from soft_actuator_testing.application.camera_capture import (
     CameraCaptureService,
     CameraDevice,
+    CameraMode,
     CameraPanelPresenter,
     CaptureError,
     CaptureHealth,
@@ -124,6 +126,78 @@ def test_preflight_failure_does_not_leave_start_latched() -> None:
     service.start_capture(Path("run"), "fake-camera")
     assert backend.starts == [(Path("run"), "fake-camera")]
     service.stop_capture()
+
+
+def test_standalone_capture_reserves_unique_workspace_output_and_status(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    service = CameraCaptureService(backend)
+
+    first = service.reserve_standalone_capture(tmp_path)
+    second = service.reserve_standalone_capture(tmp_path)
+
+    assert first.output_directory != second.output_directory
+    assert first.output_directory.parent == tmp_path / "runs"
+    assert not (tmp_path / "runs" / "video.mkv").exists()
+    assert json.loads(first.status_path.read_text())["state"] == "reserved"
+
+    service.start_capture(first, "fake-camera")
+    result = service.stop_capture("controller cyclic completion")
+
+    status = json.loads(first.status_path.read_text())
+    assert backend.starts == [(first.output_directory, "fake-camera")]
+    assert result.clean
+    assert status["state"] == "completed"
+    assert status["completion_reason"] == "controller cyclic completion"
+    assert status["video_path"] == "video.mkv"
+
+
+def test_mode_probe_rejects_unsupported_camera_before_start() -> None:
+    backend = FakeBackend()
+    presenter = CameraPanelPresenter(
+        FakeCameraDeviceSource(
+            [
+                CameraDevice(
+                    "fake-0",
+                    "Low resolution camera",
+                    "fake",
+                    modes=(CameraMode(1920, 1080, 30, "mjpeg"),),
+                )
+            ]
+        ),
+        CameraCaptureService(backend),
+    )
+
+    presenter.refresh_devices()
+
+    snapshot = presenter.state.snapshot
+    assert not snapshot.can_start
+    assert "does not advertise 3840x2160@60" in snapshot.error
+    assert backend.starts == []
+
+
+def test_presenter_applies_a_probed_target_mode_before_start() -> None:
+    class ModeBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.configured_modes: list[CameraMode] = []
+
+        def configure_input_mode(self, mode: CameraMode) -> None:
+            self.configured_modes.append(mode)
+
+    mode = CameraMode(3840, 2160, 60, "mjpeg")
+    backend = ModeBackend()
+    presenter = CameraPanelPresenter(
+        FakeCameraDeviceSource([CameraDevice("fake-0", "4K camera", "fake", (mode,))]),
+        CameraCaptureService(backend),
+    )
+    presenter.refresh_devices()
+    assert backend.configured_modes == [mode]
+
+    presenter.start_capture(Path("run"), readiness_timeout=0.1)
+    _wait_until(lambda: bool(backend.starts))
+
+    assert backend.configured_modes == [mode]
+    presenter.stop_capture()
 
 
 def test_camera_panel_presenter_discovers_starts_polls_and_stops() -> None:

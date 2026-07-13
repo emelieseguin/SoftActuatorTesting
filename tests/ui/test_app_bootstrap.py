@@ -6,6 +6,8 @@ opening a native dialog or touching real hardware.
 
 from __future__ import annotations
 
+import pytest
+
 from soft_actuator_testing.domain.run_state import RunState
 from soft_actuator_testing.ui.app import (
     DEFAULT_SHELL,
@@ -66,6 +68,20 @@ def test_rejected_studio_requires_explicit_prototype_selection(qtbot) -> None:
     qtbot.addWidget(window)
 
     assert isinstance(window, ExperimentStudioWindow)
+
+
+def test_production_true_with_a_prototype_shell_is_rejected_unambiguously(qtbot) -> None:
+    """Programmatic callers get the same unambiguous precedence as the CLI.
+
+    ``bootstrap.py`` rejects this combination before ever reaching
+    ``create_application_window``; this test proves the guard also holds for
+    any other caller that constructs the window directly, per the
+    requirement to "reject ... or define unambiguous precedence and
+    document it."
+    """
+
+    with pytest.raises(ValueError, match="production=True is incompatible with prototype_shell"):
+        create_application_window(production=True, prototype_shell=EXPERIMENT_STUDIO_PROTOTYPE)
 
 
 def test_both_shell_choices_construct_without_hardware_access(qtbot) -> None:

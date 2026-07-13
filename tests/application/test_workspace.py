@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 
+import pytest
+
 from soft_actuator_testing.application.services import ArtifactDocument
 from soft_actuator_testing.application.workspace import (
     CloseWorkspace,
@@ -82,6 +84,27 @@ def test_failed_create_removes_partial_workspace_and_preserves_original_error(tm
     assert not result.accepted
     assert result.message == "manifest write failed"
     assert not (storage / "partial").exists()
+
+
+def test_create_preserves_published_workspace_after_directory_fsync_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    controller = _controller(tmp_path)
+    controller.dispatch(SetStorageRoot(storage))
+
+    def fail_directory_fsync(_directory: Path) -> None:
+        raise OSError("injected post-replace fsync failure")
+
+    monkeypatch.setattr(ArtifactFileStore, "_fsync_directory", staticmethod(fail_directory_fsync))
+    result = controller.dispatch(CreateWorkspace("uncertain"))
+
+    root = storage / "uncertain"
+    assert not result.accepted
+    assert "injected post-replace fsync failure" in result.message
+    assert root.is_dir()
+    assert len(list((root / "artifacts" / "workspace").glob("*.json"))) == 1
 
 
 def test_relocated_workspace_resolves_analysis_source_without_current_directory(tmp_path: Path, monkeypatch) -> None:
@@ -221,3 +244,58 @@ def test_opening_workspace_never_touches_injected_hardware_bombs(tmp_path: Path)
     controller._camera = HardwareBomb()  # type: ignore[attr-defined]
 
     assert controller.dispatch(OpenWorkspace(storage / "offline")).accepted
+
+
+def test_failed_open_preserves_active_workspace_and_reports_stale_references(tmp_path: Path) -> None:
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    controller = _controller(tmp_path)
+    controller.dispatch(SetStorageRoot(storage))
+    assert controller.dispatch(CreateWorkspace("active")).accepted
+    active = controller.snapshot.root
+    assert active is not None
+
+    invalid = storage / "invalid"
+    invalid.mkdir()
+    result = controller.dispatch(OpenWorkspace(invalid))
+    assert not result.accepted
+    assert controller.snapshot.root == active
+    assert controller.snapshot.mode is WorkspaceMode.WORKSPACE
+
+    store = ArtifactFileStore(active)
+    store.save(
+        _document(
+            ArtifactType.ANALYSIS_MANIFEST,
+            {"source_video": "video/missing.avi", "geometry_artifact_id": "geometry_missing"},
+            "analysis_stale",
+        )
+    )
+    store.save(
+        _document(
+            ArtifactType.RUN_MANIFEST,
+            {"completion": "clean", "output_files": ["runs/run_missing/pressure.csv"]},
+            "run_stale",
+        )
+    )
+    assert controller.dispatch(OpenWorkspace(active)).accepted
+    paths = {issue.field_path for issue in controller.snapshot.issues}
+    assert "payload.source_video" in paths
+    assert "payload.geometry_artifact_id" in paths
+    assert "payload.output_files[0]" in paths
+
+
+def test_workspace_restore_reports_symlinked_video_that_escapes_root(tmp_path: Path) -> None:
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    controller = _controller(tmp_path)
+    controller.dispatch(SetStorageRoot(storage))
+    assert controller.dispatch(CreateWorkspace("symlinked-video")).accepted
+    root = storage / "symlinked-video"
+    outside = tmp_path / "outside.avi"
+    outside.write_bytes(b"outside")
+    video_directory = root / "video"
+    video_directory.mkdir()
+    (video_directory / "escaped.avi").symlink_to(outside)
+
+    assert controller.dispatch(OpenWorkspace(root)).accepted
+    assert any(issue.field_path == "video" for issue in controller.snapshot.issues)

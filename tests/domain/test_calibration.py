@@ -106,3 +106,16 @@ def test_quadratic_adequacy_reports_metrics_and_residuals() -> None:
     assert fit.adequacy.reason is not None
     assert fit.adequacy.max_abs_residual_kpa > 0
     assert len(fit.residuals) == 4
+
+
+@pytest.mark.parametrize("value", [True, "1.0", None])
+def test_calibration_rejects_non_numeric_values_with_a_domain_error(value: object) -> None:
+    with pytest.raises(CalibrationError) as raised:
+        CalibrationSample(value, 1.0)  # type: ignore[arg-type]
+    assert raised.value.code.name == "NON_FINITE_VALUE"
+
+
+def test_calibration_rejects_an_untyped_model_enum() -> None:
+    with pytest.raises(CalibrationError) as raised:
+        CalibrationModel("linear", (1.0, 2.0))  # type: ignore[arg-type]
+    assert raised.value.field_path == "model.type"

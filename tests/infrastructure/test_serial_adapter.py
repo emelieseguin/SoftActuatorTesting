@@ -248,3 +248,115 @@ def test_disconnect_closes_and_joins_reader() -> None:
     assert adapter.disconnect(timeout_seconds=0.5)
     assert transport.closed.is_set()
     assert not reader.is_alive()
+
+
+def test_disconnect_failure_does_not_allow_a_second_reader_to_replace_a_stuck_owner() -> None:
+    class BlockingTransport(TranscriptTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def readline(self) -> bytes:
+            self.entered.set()
+            assert self.release.wait(1)
+            return b""
+
+    transport = BlockingTransport()
+    adapter = _adapter(transport)
+    assert transport.entered.wait(1)
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        adapter.disconnect(timeout_seconds=0.01)
+    with pytest.raises(RuntimeError, match="previous serial reader"):
+        adapter.connect(SerialConnectionConfig("FAKE1"))
+
+    transport.release.set()
+    adapter.disconnect(timeout_seconds=0.5)
+
+
+def test_disconnect_wakes_a_pending_acknowledgement_wait_with_a_fault_receipt() -> None:
+    profile = ParserProfile(name="ack-test", acknowledgements_supported=True)
+    transport = TranscriptTransport()
+    adapter = _adapter(transport, profile=profile)
+    receipts = []
+    waiting = Thread(
+        target=lambda: receipts.append(
+            adapter.send_command("CMD:START", wait_for_acknowledgement=True, acknowledgement_timeout_seconds=1)
+        )
+    )
+    waiting.start()
+    for _ in range(100):
+        if transport.writes:
+            break
+        sleep(0.005)
+
+    adapter.disconnect()
+    waiting.join(0.5)
+
+    assert not waiting.is_alive()
+    assert receipts[0].state is CommandState.WRITE_FAILED
+    assert "disconnected" in receipts[0].detail
+
+
+def test_fanout_keeps_critical_run_frames_when_bounded_diagnostics_overflow() -> None:
+    transport = TranscriptTransport()
+    adapter = _adapter(transport, capacity=2)
+    diagnostics = adapter.subscribe_frames("diagnostics", capacity=2)
+    run = adapter.subscribe_frames("run-persistence", critical=True)
+
+    for index in range(10):
+        transport.push(f"{index},ignored,{index}.0\n".encode())
+
+    for _ in range(100):
+        if run.snapshot.queued_frames == 10:
+            break
+        sleep(0.005)
+
+    assert run.snapshot.capacity is None
+    assert run.snapshot.dropped_frames == 0
+    assert diagnostics.snapshot.dropped_frames >= 8
+    assert len(run.drain()) == 10
+    assert len(diagnostics.drain()) == 2
+    run.close()
+    diagnostics.close()
+    adapter.disconnect()
+
+
+def test_disconnect_retires_streams_with_visible_fault_and_reconnect_allows_fresh_subscriptions() -> None:
+    first = TranscriptTransport()
+    second = TranscriptTransport()
+
+    class ReconnectingFactory(FakeFactory):
+        def __init__(self) -> None:
+            super().__init__(first)
+            self.transports = [first, second]
+
+        def open(self, config):
+            del config
+            self.open_calls += 1
+            return self.transports.pop(0)
+
+    adapter = SerialAdapter(
+        ReconnectingFactory(),
+        parser=SerialTextParser(legacy_field_three_unconfirmed_profile()),
+    )
+    assert adapter.connect(SerialConnectionConfig("FAKE0"))
+    first_run = adapter.subscribe_frames("run-persistence", critical=True)
+    assert adapter.disconnect()
+
+    terminal = first_run.drain()
+    assert first_run.closed
+    assert len(terminal) == 1
+    assert isinstance(terminal[0], ErrorFrame) and terminal[0].source == "disconnect"
+
+    assert adapter.connect(SerialConnectionConfig("FAKE0"))
+    second_run = adapter.subscribe_frames("run-persistence", critical=True)
+    second.push(b"0.1,ignored,3.5\n")
+    for _ in range(100):
+        if second_run.snapshot.queued_frames:
+            break
+        sleep(0.005)
+    assert isinstance(second_run.drain()[0], TelemetryFrame)
+    second_run.close()
+    adapter.disconnect()

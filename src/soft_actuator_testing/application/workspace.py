@@ -168,10 +168,12 @@ class WorkspaceController:
         *,
         store_factory: Callable[[Path], WorkspaceArtifactStore],
         software_version: str | None = None,
+        mutation_guard: Callable[[], str | None] | None = None,
     ) -> None:
         self._settings = settings
         self._store_factory = store_factory
         self._software_version = software_version
+        self._mutation_guard = mutation_guard
         preferences = settings.load()
         self._snapshot = WorkspaceSnapshot(
             mode=WorkspaceMode.NONE,
@@ -187,6 +189,17 @@ class WorkspaceController:
         return self.state.snapshot
 
     def dispatch(self, command: WorkspaceCommand) -> WorkspaceCommandResult:
+        if isinstance(
+            command,
+            (SetStorageRoot, CreateWorkspace, OpenWorkspace, CloseWorkspace, OpenIndividualFiles),
+        ) and self._mutation_guard is not None:
+            reason = self._mutation_guard()
+            if reason:
+                self._replace(
+                    issues=(WorkspaceIssue(self.snapshot.root, reason, "workspace"),),
+                    status=f"Workspace action blocked: {reason}",
+                )
+                return WorkspaceCommandResult(False, reason)
         try:
             result = self._dispatch(command)
         except (DomainError, OSError, ValueError) as error:
@@ -240,6 +253,10 @@ class WorkspaceController:
         workspace_root.mkdir()
         try:
             self._write_manifest(workspace_root, name)
+        except DomainError as error:
+            if error.code is not ErrorCode.ARTIFACT_PUBLICATION_UNCERTAIN:
+                shutil.rmtree(workspace_root, ignore_errors=True)
+            raise
         except Exception:
             shutil.rmtree(workspace_root, ignore_errors=True)
             raise
@@ -253,6 +270,12 @@ class WorkspaceController:
             issues = manifest_issues or (
                 WorkspaceIssue(root, "No valid versioned workspace document was found.", "artifacts.workspace"),
             )
+            if self.snapshot.mode is WorkspaceMode.WORKSPACE:
+                self._replace(
+                    issues=issues,
+                    status=f"Workspace could not be opened; active workspace {self.snapshot.root} is unchanged.",
+                )
+                return WorkspaceCommandResult(False, issues[0].message)
             self._replace(
                 mode=WorkspaceMode.NONE,
                 root=None,
@@ -347,6 +370,18 @@ class WorkspaceController:
         video_directory = root / "video"
         if video_directory.is_dir():
             for path in sorted(candidate for candidate in video_directory.rglob("*") if candidate.is_file()):
+                try:
+                    path.resolve().relative_to(root)
+                except ValueError:
+                    issues.append(
+                        WorkspaceIssue(
+                            path,
+                            "Workspace video path escapes the workspace through a symbolic link.",
+                            "video",
+                        )
+                    )
+                    summaries.append(WorkspaceArtifactSummary("video", path, "invalid", "Path escapes workspace."))
+                    continue
                 summaries.append(WorkspaceArtifactSummary("video", path, "loaded", "Workspace video file."))
         analysis_directory = root / "analysis"
         if analysis_directory.is_dir():
@@ -356,6 +391,15 @@ class WorkspaceController:
                 )
                 if document is not None:
                     self._check_analysis_source(store, document, path, summaries, issues)
+                    self._check_analysis_geometry(store, document, path, summaries, issues)
+        run_directory = root / "runs"
+        if run_directory.is_dir():
+            for path in sorted(run_directory.glob("*/run.json")):
+                document = self._summarize_document(
+                    store, ArtifactType.RUN_MANIFEST, path.parent.name, path, summaries, issues
+                )
+                if document is not None:
+                    self._check_run_outputs(store, document, path, summaries, issues)
         return summaries, issues
 
     def _summarize_document(
@@ -394,6 +438,58 @@ class WorkspaceController:
         else:
             issues.append(WorkspaceIssue(source, "Analysis source video is missing.", "payload.source_video"))
             summaries.append(WorkspaceArtifactSummary("video", source, "missing", "Referenced by analysis artifact."))
+
+    def _check_analysis_geometry(
+        self,
+        store: ArtifactFileStore,
+        document: ArtifactDocument,
+        path: Path,
+        summaries: list[WorkspaceArtifactSummary],
+        issues: list[WorkspaceIssue],
+    ) -> None:
+        geometry_id = document.payload["geometry_artifact_id"]
+        try:
+            store.load(ArtifactType.GEOMETRY, geometry_id)
+        except DomainError as error:
+            issues.append(
+                WorkspaceIssue(
+                    path,
+                    f"Referenced geometry artifact is unavailable: {error}",
+                    "payload.geometry_artifact_id",
+                )
+            )
+            summaries.append(
+                WorkspaceArtifactSummary(
+                    ArtifactType.GEOMETRY.value,
+                    path,
+                    "missing",
+                    f"Referenced geometry artifact {geometry_id} is unavailable.",
+                    geometry_id,
+                )
+            )
+
+    def _check_run_outputs(
+        self,
+        store: ArtifactFileStore,
+        document: ArtifactDocument,
+        path: Path,
+        summaries: list[WorkspaceArtifactSummary],
+        issues: list[WorkspaceIssue],
+    ) -> None:
+        output_files = document.payload.get("output_files", [])
+        if not isinstance(output_files, list):
+            return
+        for index, relative_path in enumerate(output_files):
+            try:
+                output = store.resolve_workspace_path(relative_path)
+            except DomainError as error:
+                issues.append(WorkspaceIssue(path, str(error), f"payload.output_files[{index}]"))
+                continue
+            if output.is_file():
+                summaries.append(WorkspaceArtifactSummary("run_output", output, "loaded", "Run output file."))
+            else:
+                issues.append(WorkspaceIssue(output, "Run output file is missing.", f"payload.output_files[{index}]"))
+                summaries.append(WorkspaceArtifactSummary("run_output", output, "missing", "Referenced by run manifest."))
 
     def _workspace_documents(self, root: Path) -> tuple[list[ArtifactDocument], tuple[WorkspaceIssue, ...]]:
         directory = root / "artifacts" / "workspace"

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Protocol
 
 from soft_actuator_testing.application.camera_capture import (
+    CameraMode,
     CaptureTargetProfile,
     NegotiatedCaptureProfile,
     TARGET_4K60,
@@ -152,6 +153,21 @@ class CameraInputProfile:
         if not self.pixel_format.strip():
             raise ValueError("camera input pixel format is required")
 
+    @classmethod
+    def from_mode(cls, mode: CameraMode) -> CameraInputProfile:
+        pixel_format = {"mjpg": "mjpeg"}.get(
+            mode.pixel_format.casefold(),
+            mode.pixel_format.casefold(),
+        )
+        profile = cls(
+            width=mode.width,
+            height=mode.height,
+            fps=round(mode.fps),
+            pixel_format=pixel_format,
+        )
+        profile.verify_target()
+        return profile
+
 
 def build_device_list_command(tools: FfmpegTools, *, platform: str) -> list[str]:
     if platform == "win32":
@@ -199,6 +215,60 @@ def build_profile_list_command(
             device_identifier,
         ]
     raise ValueError(f"unsupported camera platform {platform!r}")
+
+
+_MODE_DIMENSIONS = re.compile(r"(?P<width>\d{2,5})x(?P<height>\d{2,5})")
+_MODE_FPS = re.compile(
+    r"(?P<fps>\d+(?:\.\d+)?)\s*fps\b",
+    re.IGNORECASE,
+)
+_MODE_ASSIGNED_FPS = re.compile(
+    r"\bfps\s*=\s*(?P<fps>\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_MODE_FORMAT = re.compile(
+    r"(?:pixel_format|vcodec)\s*=\s*(?P<format>[A-Za-z0-9_]+)|"
+    r"'(?P<fourcc>[A-Za-z0-9]{4})'",
+    re.IGNORECASE,
+)
+
+
+def parse_camera_modes(text: str) -> tuple[CameraMode, ...]:
+    """Parse DirectShow/V4L2 format listings into usable mode evidence.
+
+    FFmpeg's platform output is deliberately human-oriented and varies between
+    releases.  Associate a frame interval with the most recently advertised
+    dimensions and format, while accepting DirectShow's all-on-one-line form.
+    """
+
+    modes: list[CameraMode] = []
+    width = height = 0
+    pixel_format = ""
+    for line in text.splitlines():
+        dimensions = _MODE_DIMENSIONS.search(line)
+        format_match = _MODE_FORMAT.search(line)
+        if dimensions is not None:
+            width = int(dimensions.group("width"))
+            height = int(dimensions.group("height"))
+        if format_match is not None:
+            pixel_format = (
+                format_match.group("format") or format_match.group("fourcc") or ""
+            ).casefold()
+        fps_matches = tuple(_MODE_ASSIGNED_FPS.finditer(line)) or tuple(
+            _MODE_FPS.finditer(line)
+        )
+        if not fps_matches or width <= 0 or height <= 0 or not pixel_format:
+            continue
+        for fps_match in fps_matches:
+            mode = CameraMode(
+                width,
+                height,
+                float(fps_match.group("fps")),
+                pixel_format,
+            )
+            if mode not in modes:
+                modes.append(mode)
+    return tuple(modes)
 
 
 def build_camera_input_arguments(
@@ -504,6 +574,60 @@ class StorageEstimate:
         return self.available_free_bytes >= self.required_free_bytes
 
 
+@dataclass(frozen=True)
+class CaptureStoragePolicy:
+    """Conservative capacity policy used before an FFmpeg capture opens."""
+
+    default_duration_seconds: float = 600.0
+    bytes_per_second: float = 100 * 1_024 * 1_024
+    reserve_bytes: int = 1_073_741_824
+
+    def estimate(
+        self,
+        destination: Path,
+        duration_seconds: float | None,
+        *,
+        disk_usage: Callable[[Path], shutil._ntuple_diskusage] = shutil.disk_usage,
+    ) -> StorageEstimate:
+        duration = (
+            self.default_duration_seconds
+            if duration_seconds is None
+            else duration_seconds
+        )
+        probe_destination = Path(destination)
+        while not probe_destination.exists() and probe_destination != probe_destination.parent:
+            probe_destination = probe_destination.parent
+        return estimate_storage(
+            probe_destination,
+            duration_seconds=duration,
+            bytes_per_second=self.bytes_per_second,
+            reserve_bytes=self.reserve_bytes,
+            disk_usage=disk_usage,
+        )
+
+    def preflight(
+        self,
+        destination: Path,
+        duration_seconds: float | None,
+        *,
+        disk_usage: Callable[[Path], shutil._ntuple_diskusage] = shutil.disk_usage,
+    ) -> StorageEstimate:
+        estimate = self.estimate(
+            destination,
+            duration_seconds,
+            disk_usage=disk_usage,
+        )
+        if not estimate.fits:
+            raise OSError(
+                "Insufficient free storage for camera capture: "
+                f"need {estimate.required_free_bytes} bytes "
+                f"({estimate.duration_seconds:g}s at "
+                f"{estimate.bytes_per_second:.0f} bytes/s plus reserve), "
+                f"but only {estimate.available_free_bytes} bytes are available."
+            )
+        return estimate
+
+
 def estimate_storage(
     destination: Path,
     *,
@@ -591,6 +715,7 @@ def verify_video(
 
 
 __all__ = [
+    "CaptureStoragePolicy",
     "CameraInputProfile",
     "EncoderSelection",
     "FfmpegCapabilities",
@@ -608,6 +733,7 @@ __all__ = [
     "build_profile_list_command",
     "estimate_storage",
     "parse_negotiated_profile",
+    "parse_camera_modes",
     "probe_capabilities",
     "select_runtime_encoder",
     "verify_video",

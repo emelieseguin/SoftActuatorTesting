@@ -170,13 +170,22 @@ class HomeWorkspaceView(QWidget):
             self.controller.dispatch(OpenWorkspace(path))
 
     def choose_individual_file(self) -> None:
-        selected = self.file_picker.get_open_file(
-            caption="Open individual artifact file",
+        """Open one or more artifact files via keyboard or mouse.
+
+        Uses the plural ``get_open_files`` picker API so keyboard/mouse
+        multi-select has the same "import every selected artifact, in the
+        order chosen" behavior as dragging multiple files onto the
+        workspace (see ``dropEvent``). Selection order from the native
+        multi-select dialog is preserved as returned by the picker.
+        """
+
+        selected = self.file_picker.get_open_files(
+            caption="Open individual artifact files",
             directory=self.controller.snapshot.root or self.controller.snapshot.storage_root,
             filters=(FileFilter("Versioned artifact", ("*.json",)),),
         )
-        if selected is not None:
-            self.controller.dispatch(OpenIndividualFiles((selected,)))
+        if selected:
+            self.controller.dispatch(OpenIndividualFiles(tuple(selected)))
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 - Qt callback spelling
         if self._local_paths(event.mimeData()):

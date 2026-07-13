@@ -78,6 +78,26 @@ def test_loading_a_new_video_resets_the_prior_draft_geometry_without_fabricating
     assert not snapshot.can_redo
 
 
+def test_replacing_a_video_keeps_the_existing_handle_and_draft_when_old_cleanup_fails() -> None:
+    workflow, source = _workflow_with_video()
+    workflow.set_base_point(10, 10)
+    previous = workflow._open_video
+    assert previous is not None
+
+    def fail_close() -> None:
+        raise OSError("injected old-handle close failure")
+
+    previous.close = fail_close  # type: ignore[method-assign]
+    source.register(Path("second.avi"), (_frame(1),))
+
+    with pytest.raises(OSError, match="close failure"):
+        workflow.load_video(Path("second.avi"))
+
+    assert workflow._open_video is previous
+    assert workflow.snapshot.video_path == Path("synthetic.avi")
+    assert workflow.snapshot.base_point == PixelPoint(10, 10)
+
+
 def test_safe_metadata_probing_rejects_missing_registration_without_state_change() -> None:
     workflow, _ = _workflow_with_video()
     workflow.set_base_point(10, 10)

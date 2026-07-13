@@ -17,7 +17,7 @@ class JsonWorkspaceSettings:
         self.path = (
             Path(path).expanduser().resolve()
             if path is not None
-            else (Path.home() / ".config" / "soft-actuator-testing" / "workspace-settings.json").resolve()
+            else default_workspace_settings_path()
         )
 
     def load(self) -> WorkspacePreferences:
@@ -39,10 +39,15 @@ class JsonWorkspaceSettings:
 
     def save(self, preferences: WorkspacePreferences) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        storage_root = self._preference_path(preferences.storage_root, "storage_root")
+        recent_workspaces = tuple(
+            self._preference_path(path, f"recent_workspaces[{index}]")
+            for index, path in enumerate(preferences.recent_workspaces)
+        )
         payload = {
             "schema_version": 1,
-            "storage_root": str(preferences.storage_root) if preferences.storage_root else None,
-            "recent_workspaces": [str(path) for path in preferences.recent_workspaces],
+            "storage_root": str(storage_root) if storage_root else None,
+            "recent_workspaces": [str(path) for path in recent_workspaces],
         }
         temporary: Path | None = None
         try:
@@ -61,6 +66,7 @@ class JsonWorkspaceSettings:
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
             temporary = None
+            self._fsync_directory(self.path.parent)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -71,3 +77,40 @@ class JsonWorkspaceSettings:
             return None
         path = Path(value).expanduser()
         return path.resolve() if path.is_absolute() else None
+
+    @staticmethod
+    def _preference_path(value: Path | None, field_path: str) -> Path | None:
+        if value is None:
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise ValueError(f"{field_path} must be an absolute path")
+        return path.resolve()
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        if os.name == "nt":
+            return
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def default_workspace_settings_path(
+    *,
+    environment: dict[str, str] | None = None,
+    platform: str | None = None,
+) -> Path:
+    """Return the current user's native configuration location without using CWD."""
+
+    env = os.environ if environment is None else environment
+    native_platform = os.name if platform is None else platform
+    if native_platform == "nt":
+        app_data = env.get("APPDATA")
+        root = Path(app_data).expanduser() if app_data else Path.home() / "AppData" / "Roaming"
+        return (root / "SoftActuatorTesting" / "workspace-settings.json").resolve()
+    config_home = env.get("XDG_CONFIG_HOME")
+    root = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return (root / "soft-actuator-testing" / "workspace-settings.json").resolve()

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
+from threading import RLock
 
 from soft_actuator_testing.infrastructure.serial_adapter import (
     AcknowledgementFrame,
@@ -17,6 +18,7 @@ from soft_actuator_testing.infrastructure.serial_adapter import (
     RunMarkerFrame,
     SerialAdapter,
     SerialConnectionConfig,
+    SerialFrameSubscription,
     SerialPort,
     TelemetryFrame,
     UnknownFrame,
@@ -79,6 +81,8 @@ class SerialController:
         self._adapter = adapter
         self._profile = profile or (adapter.profile if adapter is not None else ParserProfile())
         self._diagnostics_capacity = diagnostics_capacity
+        self._lock = RLock()
+        self._diagnostic_subscription: SerialFrameSubscription | None = None
         status = SerialConnectionStatus.DISCONNECTED if adapter is not None else SerialConnectionStatus.UNCONFIGURED
         initial_diagnostic = (
             "No serial adapter is configured; this screen will not access a physical port."
@@ -98,19 +102,23 @@ class SerialController:
 
     @property
     def snapshot(self) -> SerialConnectionSnapshot:
-        return self._snapshot
+        with self._lock:
+            return self._snapshot
 
     @property
     def profile(self) -> ParserProfile:
         return self._profile
 
     def subscribe(self, listener: Callable[[SerialConnectionSnapshot], None]) -> Callable[[], None]:
-        self._listeners.append(listener)
-        listener(self._snapshot)
+        with self._lock:
+            self._listeners.append(listener)
+            snapshot = self._snapshot
+        listener(snapshot)
 
         def unsubscribe() -> None:
-            if listener in self._listeners:
-                self._listeners.remove(listener)
+            with self._lock:
+                if listener in self._listeners:
+                    self._listeners.remove(listener)
 
         return unsubscribe
 
@@ -164,6 +172,7 @@ class SerialController:
                 )
             )
             return False
+        self._ensure_diagnostic_subscription()
         self._publish(
             replace(
                 self._snapshot,
@@ -180,7 +189,17 @@ class SerialController:
     def disconnect(self) -> bool:
         if self._adapter is None:
             return False
-        disconnected = self._adapter.disconnect()
+        try:
+            disconnected = self._adapter.disconnect()
+        except Exception as error:
+            self._publish(
+                replace(
+                    self._snapshot,
+                    status=SerialConnectionStatus.FAULT,
+                    diagnostics=self._append("disconnect", f"Serial disconnect failed: {error}"),
+                )
+            )
+            return False
         self._publish(
             replace(
                 self._snapshot,
@@ -199,26 +218,56 @@ class SerialController:
     def poll(self, maximum: int | None = None) -> tuple[ParsedFrame, ...]:
         if self._adapter is None:
             return ()
-        frames = self._adapter.drain_frames(maximum)
-        if not frames and self._snapshot.dropped_frames == self._adapter.dropped_frames:
+        subscription = self._diagnostic_subscription
+        if subscription is None:
             return ()
-        diagnostics = self._snapshot.diagnostics
-        last_received = self._snapshot.last_received_at
+        frames = subscription.drain(maximum)
+        snapshot = self.snapshot
+        if not frames and snapshot.dropped_frames == subscription.dropped_frames:
+            return ()
+        diagnostics = snapshot.diagnostics
+        last_received = snapshot.last_received_at
         for frame in frames:
             diagnostics = self._append_frame(diagnostics, frame)
             last_received = frame.received_at
+        dropped_frames = subscription.dropped_frames
+        if dropped_frames > snapshot.dropped_frames:
+            diagnostics = (
+                diagnostics
+                + (
+                    SerialDiagnostic(
+                        None,
+                        "diagnostic-overflow",
+                        f"Dropped {dropped_frames - snapshot.dropped_frames} frame(s) from the bounded diagnostics queue "
+                        f"({dropped_frames} total).",
+                    ),
+                )
+            )[-self._diagnostics_capacity :]
         self._publish(
             replace(
-                self._snapshot,
+                snapshot,
                 diagnostics=diagnostics,
-                dropped_frames=self._adapter.dropped_frames,
+                dropped_frames=dropped_frames,
                 last_received_at=last_received,
                 status=SerialConnectionStatus.FAULT
-                if any(isinstance(frame, ErrorFrame) and frame.source in {"read", "write"} for frame in frames)
-                else self._snapshot.status,
+                if any(isinstance(frame, ErrorFrame) and frame.source in {"read", "write", "shutdown", "close"} for frame in frames)
+                else snapshot.status,
             )
         )
         return frames
+
+    def subscribe_frames(
+        self,
+        name: str,
+        *,
+        critical: bool = False,
+        capacity: int | None = None,
+    ) -> SerialFrameSubscription:
+        """Create an independent workflow stream from the one serial reader."""
+
+        if self._adapter is None:
+            raise RuntimeError("No serial adapter is configured.")
+        return self._adapter.subscribe_frames(name, critical=critical, capacity=capacity)
 
     def send_command(
         self,
@@ -267,13 +316,55 @@ class SerialController:
         )
 
     def start_legacy_run(self) -> CommandReceipt | None:
-        return self.send_command("CMD:START")
+        return self.send_diagnostic_command("CMD:START")
 
     def stop_legacy_run(self) -> CommandReceipt | None:
         return self.send_command("CMD:STOP")
 
     def set_legacy_calibration_streaming(self, enabled: bool) -> CommandReceipt | None:
         return self.send_command("CMD:CAL_ON" if enabled else "CMD:CAL_OFF")
+
+    def send_diagnostic_command(
+        self,
+        command: str,
+        *,
+        wait_for_acknowledgement: bool = False,
+        acknowledgement_timeout_seconds: float = 1.0,
+    ) -> CommandReceipt | None:
+        """Send a safe diagnostic command without bypassing run readiness."""
+
+        if self._is_unsafe_diagnostic_run_start(command):
+            self._publish(
+                replace(
+                    self.snapshot,
+                    diagnostics=self._append(
+                        "command-blocked",
+                        "CMD:START is blocked in diagnostics. Use Live Run after RunController readiness and camera proof.",
+                    ),
+                )
+            )
+            return None
+        return self.send_command(
+            command,
+            wait_for_acknowledgement=wait_for_acknowledgement,
+            acknowledgement_timeout_seconds=acknowledgement_timeout_seconds,
+        )
+
+    @staticmethod
+    def _is_unsafe_diagnostic_run_start(command: str) -> bool:
+        normalized = " ".join(command.upper().replace("_", " ").split())
+        return normalized == "START" or normalized.startswith("CMD:START") or normalized.startswith("CMD:RUN START")
+
+    def _ensure_diagnostic_subscription(self) -> None:
+        if self._adapter is None:
+            return
+        current = self._diagnostic_subscription
+        if current is not None and not current.closed:
+            return
+        self._diagnostic_subscription = self._adapter.subscribe_frames(
+            "diagnostics",
+            capacity=self._diagnostics_capacity,
+        )
 
     def _append(self, category: str, message: str, received_at: datetime | None = None) -> tuple[SerialDiagnostic, ...]:
         return (self._snapshot.diagnostics + (SerialDiagnostic(received_at, category, message),))[-self._diagnostics_capacity :]
@@ -298,7 +389,9 @@ class SerialController:
         return (diagnostics + (SerialDiagnostic(frame.received_at, category, message),))[-self._diagnostics_capacity :]
 
     def _publish(self, snapshot: SerialConnectionSnapshot) -> SerialConnectionSnapshot:
-        self._snapshot = snapshot
-        for listener in tuple(self._listeners):
+        with self._lock:
+            self._snapshot = snapshot
+            listeners = tuple(self._listeners)
+        for listener in listeners:
             listener(snapshot)
         return snapshot

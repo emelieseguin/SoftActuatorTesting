@@ -64,6 +64,7 @@ class OpenCvVideoFileReader:
     """Safely probes and opens prerecorded video files with OpenCV."""
 
     def open(self, source: Path, *, cancellation: CancellationToken | None = None) -> OpenVideoFile:
+        self._check_cancelled(cancellation)
         source = Path(source)
         if not source.is_file():
             raise GeometryError(
@@ -73,6 +74,11 @@ class OpenCvVideoFileReader:
                 "Choose an existing prerecorded video file.",
             )
         capture = cv2.VideoCapture(str(source))
+        try:
+            self._check_cancelled(cancellation)
+        except Exception:
+            capture.release()
+            raise
         if not capture.isOpened():
             capture.release()
             raise GeometryError(
@@ -88,6 +94,7 @@ class OpenCvVideoFileReader:
         return _OpenCvVideoFile(capture, metadata)
 
     def _probe(self, capture: cv2.VideoCapture, cancellation: CancellationToken | None) -> VideoMetadata:
+        self._check_cancelled(cancellation)
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         fps_raw = capture.get(cv2.CAP_PROP_FPS)
@@ -106,8 +113,10 @@ class OpenCvVideoFileReader:
             height, width = probe_frame.shape[:2]
             capture.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
 
+        self._check_cancelled(cancellation)
         frame_count = reported_count if reported_count > 0 else self._count_frames_by_scanning(capture, cancellation)
         capture.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
+        self._check_cancelled(cancellation)
         if frame_count <= 0:
             raise GeometryError(
                 ErrorCode.GEOMETRY_INVALID,
@@ -116,6 +125,11 @@ class OpenCvVideoFileReader:
                 "Choose a video that contains at least one frame.",
             )
         return VideoMetadata(FrameSize(width, height), frame_count, fps)
+
+    @staticmethod
+    def _check_cancelled(cancellation: CancellationToken | None) -> None:
+        if cancellation is not None and cancellation.is_cancelled():
+            raise VideoProbeCancelled("video probing was cancelled")
 
     @staticmethod
     def _count_frames_by_scanning(capture: cv2.VideoCapture, cancellation: CancellationToken | None) -> int:

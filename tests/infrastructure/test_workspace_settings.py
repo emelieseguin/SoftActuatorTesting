@@ -5,8 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from soft_actuator_testing.application.workspace import WorkspacePreferences
-from soft_actuator_testing.infrastructure.workspace import JsonWorkspaceSettings
+from soft_actuator_testing.infrastructure.workspace import (
+    JsonWorkspaceSettings,
+    default_workspace_settings_path,
+)
 
 
 def test_json_workspace_settings_round_trip_without_current_directory(tmp_path: Path, monkeypatch) -> None:
@@ -24,3 +29,21 @@ def test_json_workspace_settings_recovers_from_invalid_content(tmp_path: Path) -
     path = tmp_path / "settings.json"
     path.write_text(json.dumps({"schema_version": 99, "storage_root": "relative"}), encoding="utf-8")
     assert JsonWorkspaceSettings(path).load() == WorkspacePreferences()
+
+
+def test_json_workspace_settings_rejects_relative_paths_before_persisting(tmp_path: Path) -> None:
+    settings = JsonWorkspaceSettings(tmp_path / "settings.json")
+    with pytest.raises(ValueError, match="absolute"):
+        settings.save(WorkspacePreferences(Path("relative"), ()))
+    assert not settings.path.exists()
+
+
+def test_default_workspace_settings_path_uses_native_platform_configuration_roots() -> None:
+    assert default_workspace_settings_path(
+        environment={"APPDATA": "/profiles/operator/AppData/Roaming"},
+        platform="nt",
+    ) == Path("/profiles/operator/AppData/Roaming/SoftActuatorTesting/workspace-settings.json")
+    assert default_workspace_settings_path(
+        environment={"XDG_CONFIG_HOME": "/profiles/operator/config"},
+        platform="posix",
+    ) == Path("/profiles/operator/config/soft-actuator-testing/workspace-settings.json")

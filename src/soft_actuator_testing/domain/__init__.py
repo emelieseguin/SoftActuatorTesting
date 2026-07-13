@@ -15,7 +15,7 @@ from .calibration import (
     apply_calibration,
     fit_calibration,
 )
-from .geometry import FrameSize, NormalizedRoi, PixelPoint, VideoGeometry
+from .geometry import FrameSize, NormalizedRoi, PixelPoint, PreviewGeometryTransform, PreviewTransformPolicy, VideoGeometry
 from .run_state import RunCompletion, RunSnapshot, RunState, finalize_run, request_stop, transition
 
 __all__ = [
@@ -36,6 +36,8 @@ __all__ = [
     "MarkerDetectionResult",
     "NormalizedRoi",
     "PixelPoint",
+    "PreviewGeometryTransform",
+    "PreviewTransformPolicy",
     "RunCompletion",
     "RunSnapshot",
     "RunState",

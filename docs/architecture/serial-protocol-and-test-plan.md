@@ -30,11 +30,16 @@ hardware safety limits.
 ## Design
 
 `infrastructure.serial_adapter.SerialAdapter` exclusively owns an opened
-transport, reader thread, close, and join. It exposes a bounded drop-oldest
-frame queue, so a slow UI cannot block reads. Reader output consists solely of
-immutable typed frames, and UI/application code drains it on its own schedule.
-Both source receive time and command-send time are retained. Read/write faults
-become `ErrorFrame`s rather than silently ending a worker.
+transport, reader thread, close, join, and frame dispatch. It fans each
+immutable typed frame out to explicitly named independent subscriptions, so
+diagnostics, calibration capture, and run persistence cannot consume one
+another's data. Noncritical queues (including diagnostics) are bounded
+drop-oldest streams with per-subscription accounting; critical run and active
+calibration streams are unbounded/lossless. `drain_frames()` remains only as a
+deprecated bounded compatibility stream and is not used by production
+workflows. Both source receive time and command-send time are retained.
+Read/write/disconnect faults become `ErrorFrame`s rather than silently ending a
+worker.
 
 `application.serial_controller.SerialController` is a separate Qt-free
 connection/diagnostic presenter state seam. It is intentionally not folded
@@ -49,12 +54,28 @@ reported late rather than being allowed to confirm a newer identical command.
 
 ## Test plan
 
+### Serial fan-out safety test plan (2026-07-13)
+
+Before changing the serial consumer boundary, the hardware-free suite will
+exercise one real adapter/controller composition with independent diagnostics,
+calibration, and run subscriptions. It will prove that diagnostic polling
+cannot drain a calibration capture or active-run persistence stream; that an
+end marker and a fault each reach the run finalizer; and that calibration still
+accepts a fresh mapped voltage while the run persists its own copy.
+
+Adapter tests will also prove bounded diagnostic queue drop accounting, an
+unbounded critical run stream, subscription cleanup on disconnect, pending ACK
+wait cancellation, and a clean reconnect with fresh subscriptions. UI tests
+will prove that the diagnostics panel exposes an explicit rejection for
+`CMD:START` while retaining safe diagnostic commands. No physical port is used.
+
 Default, hardware-free tests use injected transports and transcript fixtures:
 
 1. Parse every supplied serial fixture, including run markers, unconfigured
    mappings, malformed/short rows, and reader-error sentinels.
-2. Assert port refresh, configuration, UTF-8 replacement, queue saturation
-   drop-oldest policy, duplicate connect/disconnect, read/write fault reporting,
+2. Assert port refresh, configuration, UTF-8 replacement, independent
+   subscription fan-out, bounded diagnostic drop accounting, lossless critical
+   stream delivery, duplicate connect/disconnect, read/write fault reporting,
    deterministic shutdown/join, and no real port construction by default.
 3. Assert each legacy command line is newline-encoded exactly; verify
    acknowledgement success, timeout, and stale/late acknowledgement handling.

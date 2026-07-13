@@ -39,3 +39,14 @@ def test_detection_and_analysis_reject_inconsistent_or_nonfinite_results() -> No
         AnalysisFrameResult(1, 0.1, MarkerDetectionResult.missing(), 4.0)
     with pytest.raises(DomainError, match="must differ"):
         actuator_angle_degrees(PixelPoint(1, 1), PixelPoint(1, 1))
+
+
+def test_analysis_contracts_reject_wrong_types_and_boolean_frame_indexes() -> None:
+    with pytest.raises(DomainError) as state:
+        MarkerDetectionResult("detected", PixelPoint(1, 1), 0.5)  # type: ignore[arg-type]
+    assert state.value.field_path == "detection.state"
+
+    detection = MarkerDetectionResult(DetectionState.DETECTED, PixelPoint(2, 1), 0.5)
+    with pytest.raises(DomainError) as frame:
+        AnalysisFrameResult(True, 0.0, detection, 0.0)  # type: ignore[arg-type]
+    assert frame.value.field_path == "frame_index"
